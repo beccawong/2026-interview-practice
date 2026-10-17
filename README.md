@@ -18,4 +18,8 @@ uv run pytest
 | DELETE | `/api/v1/items/{id}` | Delete (204) |
 | GET | `/api/health` | Health check (unversioned) |
 
+Data is stored in SQLite (`item_api.db`). The schema is defined by the SQLAlchemy models in
+[`models/`](src/item_api/models/). Delete `item_api.db` after changing
+them. See ARCHITECTURE.md § Database.
+
 Settings come from `ITEM_API_*` environment variables or `.env` (see `core/config.py`).

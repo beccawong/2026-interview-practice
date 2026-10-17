@@ -7,6 +7,7 @@ requires-python = ">=3.13"
 dependencies = [
     "fastapi[standard]>=0.143.3",
     "pydantic-settings>=2.16.0",
+    "sqlalchemy>=2.1.5",
 ]
 
 [project.scripts]
@@ -53,8 +54,8 @@ layers = [
     "item_api.main",
     "item_api.api",
     "item_api.services",
-    "item_api.repositories",
-    "item_api.domain",
+    "item_api.crud",
+    "item_api.models | item_api.domain",
 ]
 
 [[tool.importlinter.contracts]]
@@ -62,7 +63,8 @@ name = "Inner layers never import FastAPI/Starlette"
 type = "forbidden"
 source_modules = [
     "item_api.services",
-    "item_api.repositories",
+    "item_api.crud",
+    "item_api.models",
     "item_api.domain",
 ]
 forbidden_modules = ["fastapi", "starlette"]

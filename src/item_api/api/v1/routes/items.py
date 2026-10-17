@@ -4,8 +4,7 @@ from uuid import UUID
 from fastapi import APIRouter, Query, status
 
 from item_api.api.deps import ItemServiceDep
-from item_api.api.v1.schemas.item import ItemResponse
-from item_api.domain.item import ItemCreate, ItemUpdate
+from item_api.api.v1.schemas.item import ItemCreateRequest, ItemResponse, ItemUpdateRequest
 
 router = APIRouter(prefix="/items", tags=["items"])
 
@@ -17,28 +16,30 @@ def list_items(
     limit: Annotated[int, Query(ge=1, le=100)] = 100,
 ) -> list[ItemResponse]:
     return [
-        ItemResponse.model_validate(item) for item in service.list_items(offset=offset, limit=limit)
+        ItemResponse.from_model(item) for item in service.list_items(offset=offset, limit=limit)
     ]
 
 
 @router.get("/{item_id}")
 def get_item(item_id: UUID, service: ItemServiceDep) -> ItemResponse:
-    return ItemResponse.model_validate(service.get_item(item_id))
+    return ItemResponse.from_model(service.get_item(item_id))
 
 
 @router.post("", status_code=status.HTTP_201_CREATED)
-def create_item(payload: ItemCreate, service: ItemServiceDep) -> ItemResponse:
-    return ItemResponse.model_validate(service.create_item(payload))
+def create_item(payload: ItemCreateRequest, service: ItemServiceDep) -> ItemResponse:
+    return ItemResponse.from_model(service.create_item(payload.to_input()))
 
 
 @router.put("/{item_id}")
-def replace_item(item_id: UUID, payload: ItemCreate, service: ItemServiceDep) -> ItemResponse:
-    return ItemResponse.model_validate(service.replace_item(item_id, payload))
+def replace_item(
+    item_id: UUID, payload: ItemCreateRequest, service: ItemServiceDep
+) -> ItemResponse:
+    return ItemResponse.from_model(service.replace_item(item_id, payload.to_input()))
 
 
 @router.patch("/{item_id}")
-def update_item(item_id: UUID, payload: ItemUpdate, service: ItemServiceDep) -> ItemResponse:
-    return ItemResponse.model_validate(service.update_item(item_id, payload))
+def update_item(item_id: UUID, payload: ItemUpdateRequest, service: ItemServiceDep) -> ItemResponse:
+    return ItemResponse.from_model(service.update_item(item_id, payload.to_changes()))
 
 
 @router.delete("/{item_id}", status_code=status.HTTP_204_NO_CONTENT)

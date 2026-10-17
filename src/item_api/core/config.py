@@ -11,6 +11,7 @@ class Settings(BaseSettings):
     app_name: str = "Item API"
     api_prefix: str = "/api"  # version segments come from api/v<N>/ routers
     debug: bool = False
+    database_url: str = "sqlite:///./item_api.db"
 
 
 @lru_cache

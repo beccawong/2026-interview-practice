@@ -59,6 +59,15 @@ def test_patch_item_changes_only_given_fields(client: TestClient) -> None:
     assert body["updated_at"] >= created["updated_at"]
 
 
+def test_patch_null_description_clears_it(client: TestClient) -> None:
+    created = _create(client)
+
+    response = client.patch(f"{ITEMS}/{created['id']}", json={"description": None})
+
+    assert response.status_code == 200
+    assert response.json()["description"] is None
+
+
 def test_patch_rejects_null_for_required_field(client: TestClient) -> None:
     created = _create(client)
 
