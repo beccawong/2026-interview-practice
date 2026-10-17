@@ -6,7 +6,7 @@ from uuid import UUID
 from sqlalchemy.orm import Session
 
 from item_api.crud import item as item_crud
-from item_api.domain.errors import ConflictError, NotFoundError
+from item_api.core.errors import ConflictError, NotFoundError
 from item_api.models.item import Item
 from item_api.services.unset import UNSET, Unset
 

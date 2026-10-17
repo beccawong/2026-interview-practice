@@ -3,7 +3,7 @@
 from fastapi import FastAPI, Request, status
 from fastapi.responses import JSONResponse
 
-from item_api.domain.errors import ConflictError, DomainError, NotFoundError
+from item_api.core.errors import ConflictError, DomainError, NotFoundError
 
 _STATUS_BY_ERROR: dict[type[DomainError], int] = {
     NotFoundError: status.HTTP_404_NOT_FOUND,

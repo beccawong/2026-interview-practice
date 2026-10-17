@@ -3,7 +3,7 @@ from uuid import uuid4
 
 import pytest
 
-from item_api.domain.errors import ConflictError, NotFoundError
+from item_api.core.errors import ConflictError, NotFoundError
 from item_api.services.item import ItemChanges, ItemInput, ItemService
 
 WIDGET = ItemInput(name="Widget", description="A widget", price=Decimal("1.00"), in_stock=True)
