@@ -1,0 +1,73 @@
+[project]
+name = "item-api"
+version = "0.1.0"
+description = "Layered FastAPI + Pydantic REST service for Items."
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "fastapi[standard]>=0.143.3",
+    "pydantic-settings>=2.16.0",
+]
+
+[project.scripts]
+item-api = "item_api.main:run"
+
+[build-system]
+requires = ["uv_build>=0.13.1,<0.14.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "import-linter>=2.15",
+    "mypy>=2.4.0",
+    "pytest>=9.1.1",
+    "ruff>=0.17.1",
+]
+
+[tool.fastapi]
+entrypoint = "item_api.main:app"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"
+
+[tool.ruff]
+line-length = 100
+target-version = "py313"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP", "SIM", "N", "RUF", "FAST"]
+
+[tool.mypy]
+strict = true
+plugins = ["pydantic.mypy"]
+
+[tool.importlinter]
+root_package = "item_api"
+include_external_packages = true
+
+[[tool.importlinter.contracts]]
+name = "Layered architecture: dependencies point inward only"
+type = "layers"
+layers = [
+    "item_api.main",
+    "item_api.api",
+    "item_api.services",
+    "item_api.repositories",
+    "item_api.domain",
+]
+
+[[tool.importlinter.contracts]]
+name = "Inner layers never import FastAPI/Starlette"
+type = "forbidden"
+source_modules = [
+    "item_api.services",
+    "item_api.repositories",
+    "item_api.domain",
+]
+forbidden_modules = ["fastapi", "starlette"]
+
+[[tool.importlinter.contracts]]
+name = "API versions are independent of each other"
+type = "independence"
+modules = ["item_api.api.v1"]  # add each new version here
