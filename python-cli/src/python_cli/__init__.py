@@ -1,2 +1,5 @@
-def main() -> None:
-    print("Hello from python-cli!")
+from python_cli import cli
+
+
+def main() -> int:
+    return cli.main()
