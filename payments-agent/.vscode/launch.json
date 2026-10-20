@@ -1,0 +1,29 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "payagent: pick args",
+      "type": "debugpy",
+      "request": "launch",
+      "module": "payagent",
+      "args": "${command:pickArgs}",
+      "env": {
+        "PAYAGENT_FILE": "/tmp/payagent-practice.json"
+      },
+      "console": "integratedTerminal",
+      "justMyCode": true
+    },
+    {
+      "name": "payagent: run plans/invoices.jsonl",
+      "type": "debugpy",
+      "request": "launch",
+      "module": "payagent",
+      "args": ["run", "plans/invoices.jsonl"],
+      "env": {
+        "PAYAGENT_FILE": "/tmp/payagent-practice.json"
+      },
+      "console": "integratedTerminal",
+      "justMyCode": true
+    }
+  ]
+}

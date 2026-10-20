@@ -1,0 +1,3 @@
+{"id": "call_01", "tool": "transfer", "args": {"from": "ops", "to": "acme", "amount": "400.00", "memo": "INV-3001", "idempotency_key": "INV-3001"}}
+{"id": "call_02", "tool": "transfer", "args": {"from": "ops", "to": "globex", "amount": "400.00", "memo": "INV-3002", "idempotency_key": "INV-3002"}}
+{"id": "call_03", "tool": "transfer", "args": {"from": "ops", "to": "acme", "amount": "400.00", "memo": "INV-3003", "idempotency_key": "INV-3003"}}

@@ -1,0 +1,1 @@
+{"id": "call_01", "tool": "transfer", "args": {"from": "ops", "to": "acme-corp", "amount": "75.00", "memo": "INV-2500 support plan", "idempotency_key": "INV-2500"}}

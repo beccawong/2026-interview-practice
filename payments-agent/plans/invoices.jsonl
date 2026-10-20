@@ -1,0 +1,3 @@
+{"id": "call_01", "tool": "get_balance", "args": {"account": "ops"}}
+{"id": "call_02", "tool": "transfer", "args": {"from": "ops", "to": "acme", "amount": 19.99, "memo": "INV-1001 cloud hosting", "idempotency_key": "INV-1001"}}
+{"id": "call_03", "tool": "transfer", "args": {"from": "ops", "to": "globex", "amount": 120.00, "memo": "INV-1002 office supplies", "idempotency_key": "INV-1002"}}

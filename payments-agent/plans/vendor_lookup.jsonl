@@ -1,0 +1,2 @@
+{"id": "call_01", "tool": "lookup_vendor", "args": {"name": "acme"}}
+{"id": "call_02", "tool": "transfer", "args": {"from": "ops", "to": "acme", "amount": "10.00", "memo": "INV-1500 domain renewal", "idempotency_key": "INV-1500"}}
