@@ -141,7 +141,7 @@ def main(argv: list[str] | None = None) -> int:
             return 0
         ledger = storage.load(path)
         changed = COMMANDS[args.command](args, ledger)
-    except (LedgerError, PolicyError, ValueError, OSError) as exc:
+    except (LedgerError, PolicyError, ValueError, OSError, agent.InvalidTool) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
     if changed:

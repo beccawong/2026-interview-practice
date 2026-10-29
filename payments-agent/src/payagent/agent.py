@@ -6,6 +6,7 @@ through. The returned dict is what gets sent back to the model as the tool resul
 """
 
 import json
+from decimal import Decimal
 from pathlib import Path
 
 from payagent import service
@@ -15,6 +16,8 @@ from payagent.policy import PolicyError
 
 AGENT_ACTOR = "agent"
 
+class InvalidTool(Exception):
+    pass
 
 def tool_get_balance(ledger: Ledger, call: dict) -> dict:
     account = call["args"]["account"]
@@ -43,6 +46,9 @@ TOOLS = {
 def run_call(ledger: Ledger, call: dict) -> dict:
     """Run one tool call and return the result for the model."""
     tool = TOOLS.get(call["tool"])
+    if tool is None:
+        raise InvalidTool(f"{call["tool"]} does not exist")
+    
     try:
         return {"ok": True, "result": tool(ledger, call)}
     except (LedgerError, PolicyError, ValueError) as exc:
@@ -51,4 +57,4 @@ def run_call(ledger: Ledger, call: dict) -> dict:
 
 def load_plan(path: Path) -> list[dict]:
     with open(path) as f:
-        return [json.loads(line) for line in f if line.strip()]
+        return [json.loads(line, parse_float=Decimal) for line in f if line.strip()]
