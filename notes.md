@@ -130,3 +130,31 @@ Claude's suggestion:
   older versions, so check what CoderPad uses.
 
 ✻ Worked for 39s · done 4:41 PM
+
+---
+
+Notes
+
+Most backtracking solutions follow the same template:
+
+def backtrack(state):
+    if state is complete:
+        return True
+
+    for choice in available_choices:
+        if choice is valid:
+            make the choice
+            if backtrack(state):
+                return True
+            undo the choice      # the "back" in backtracking
+
+    return False
+
+So you don't need to invent an algorithm each time. You only need to answer four questions:
+
+1. Decision: What am I deciding at each step?
+2. Choices: What are my options for that decision?
+3. Validity: What makes an option allowed?
+4. Undo: What do I need to restore when I back out?
+
+Is this an algorithms or system design question?
