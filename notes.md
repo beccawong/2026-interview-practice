@@ -157,4 +157,36 @@ So you don't need to invent an algorithm each time. You only need to answer four
 3. Validity: What makes an option allowed?
 4. Undo: What do I need to restore when I back out?
 
-Is this an algorithms or system design question?
+-------
+How to solve wordy coding problems:
+
+Phase 1: Understand (before any algorithm)
+
+Read twice. The first read is for the gist. On the second, annotate as you go: underline constraints, circle key verbs, and mark anything ambiguous.
+Find the “what to return” sentence, usually near the end. Write down exactly what’s being asked and what’s being optimized (max, min, count, yes/no) and over what.
+Strip the story. Rewrite the problem as one plain sentence with no characters or scenery: “Given X, return Y such that Z.”
+Pin down input, output, and constraints:
+Input: types and sizes
+Output: type and what it represents (a value, an index, a list)
+Constraints: ranges, sorted or not, contiguous or not, order preserved or not
+Ask clarifying questions from a standard list: empty input, duplicates, negatives, ties, what to return if no answer exists, whether the input can be modified.
+
+Phase 2: Verify understanding
+
+Trace the given example by hand. Check that your understanding produces the same answer. If it doesn’t, you’ve found a misreading before writing any code.
+Scan once more for buried details, such as tie-breaking rules, a sentence in the middle that adds a condition, and value versus index versus items.
+State your understanding out loud to the interviewer and let them correct you.
+
+Phase 3: Solve
+
+Propose brute force first, with its complexity. It shows you understand the problem and often reveals where the inefficiency is.
+Look for the pattern (two pointers, sliding window, hash map, binary search, BFS/DFS, and so on) using the constraints as hints. Input size of 10^5 rules out O(n²), for example.
+
+Phase 4: Verify the code
+
+Break the code into small named pieces so each can be tested alone.
+Trace in layers with a table: variables as columns, one row per iteration, inner pieces verified separately and treated as black boxes in the outer trace.
+Test the boundaries: the answer and the value just below it, the smallest input, and the extremes of the constraints.
+Read each comparison in plain English (> vs >= and < vs <=) and check what each variable means at that line and what’s true when each loop ends.
+
+If you only remember three of these, keep: find the “what to return” sentence, trace the example before coding, and trace your code on a small input after.
