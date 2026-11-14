@@ -31,3 +31,105 @@ Sources:
     https://www.linkjob.ai/interview-questions/openai-coding-interview/
     https://sx-studio.com/openai-sde-interview/
 """
+import unittest
+from dataclasses import dataclass
+from typing import Any
+
+
+@dataclass
+class DbTable:
+    name: str
+    metadata: dict
+    data: list
+
+class InMemoryDb:
+    def __init__(self):
+        # tablename: {data: [{colName: value...}], metadata: {}}
+        self.table_data: dict[str, DbTable] = {}
+
+    def create_table(self, name: str, columns: list[str]):
+        if name in self.table_data:
+            raise ValueError
+
+        table = DbTable(name, {"columns": set(columns)}, [])
+        self.table_data[name] = table
+        return True
+
+    def insert(self, table_name: str, row: dict[str, Any]):
+        row_to_insert = {}
+        table = self.table_data[table_name]
+        for k, v in row:
+            if k not in table.metadata["cols"]:
+                raise ValueError
+            if k in row_to_insert:
+                raise ValueError
+            row_to_insert[k] = v
+        table.data.append(row_to_insert)
+
+    def _compare(self, op: str, left: Any, right: Any) -> bool:
+        match op:
+            case "==":
+                return left == right
+            case "<=":
+                return left <= right
+            case ">=":
+                return left >= right
+            case "!=":
+                return left != right
+            case "<":
+                return left < right
+            case ">":
+                return left > right
+            case _:
+                raise ValueError("Unknown operation")
+    
+
+    def select(self, table_name: str, where: list[tuple[str, str, Any]]) -> list[dict]:
+        data_rows = self.table_data[table_name].data
+        result = []
+
+        for row in data_rows:
+            accept = True
+            for condition in where:
+                pred_col = condition[0]
+                pred_op = condition[1]
+                pred_val = condition[2]
+                accept = accept and self._compare(pred_op, row[pred_col], pred_val)
+                if not accept:
+                    break
+            if accept:
+                result.append(row)
+
+        return result
+
+    def sort_rows(self, table_name: str, order_by: list[tuple[str, str]]) -> list[dict]:
+        data_rows = self.table_data[table_name].data
+        for clause in order_by:
+
+
+class TestInMemoryDb(unittest.TestCase):
+    TABLE_NAME_1 = "test_table"
+    def setUp(self):
+        self.db = InMemoryDb()
+        self.db.create_table("test_table", ["col1", "col2"])
+
+    def test_insert_into_new_table(self):
+        self.db.insert(self.TABLE_NAME_1, {"col1": 1, "col2": 34})
+
+    def test_insert_with_missing_cols(self):
+        pass
+
+    def test_insert_with_all_cols_missing(self):
+        pass
+
+    def test_insert_with_invalid_cols(self):
+        pass
+
+    def test_insert_with_invalid_table(self):
+        pass
+
+    def test_insert_with_more_cols(self):
+        pass
+
+    def solve(slot_index):
+        
