@@ -1,0 +1,1717 @@
+▗ ▗   ▖ ▖  Claude Code v2.1.325
+           Opus 5.5 · Claude Pro
+ ▘▘   ▝▝   ~/Development/verkada-interview/interview-vkda-rebeccaw
+
+
+❯ I am going onsite to interview for a software engineering role at Verkada.    
+  They have an architecture road that include the below questions. What do the  
+  questions mean, especially the part around double-counting bug?               
+  Q1:                                                                           
+  Primary Focus: Database schema design, query efficiency, indexing,            
+  transaction management, and concurrency control.                              
+  Format: A multi-part system design prompt that starts with a basic data       
+  modeling task and expands into handling race conditions and complex security  
+  business logic.                                                               
+                                                                                
+  Q2:                                                                           
+                                                                                
+  Part A (Primary Focus): Design an up-to-the-minute status dashboard as        
+  cheaply as possible while preventing deduplication (devices double-counting   
+  due to bugs sending $>1$ ping/minute).                                        
+                                                                                
+  Part B (Optimization): Modify the design if the requirement changes from      
+  exact counts to percentages (1 decimal place).                                
+                                                                                
+  Part C (Estimation): Conduct back-of-the-envelope estimations for hardware    
+  budgeting, load balancer throughput, server node count, and potential system  
+  bottlenecks.                                                                  
+
+⏺ Q1: Database design with concurrency
+
+  This is a schema design question that gets harder as it goes. Given your
+  repo's latest commit ("door schedules"), it's probably an access-control
+  scenario: doors, users, credentials, schedules. It will likely move through
+  three stages.
+
+  1. Basic data modeling. You define the tables and how they relate, for
+     example: orgs → sites → doors, users → access_groups, access_groups ↔ doors
+     (a many-to-many join table), schedules with time windows and a timezone.
+     They'll watch whether you normalize the data sensibly and choose good
+     primary and foreign keys.
+  2. Query efficiency and indexing. The core question is something like "can
+     user U open door D right now?" That check runs on every badge swipe, so it
+     needs to be fast. You'd add indexes such as a composite index on (user_id, 
+     door_id) or (door_id, group_id), and maybe denormalize or cache the result.
+     Expect "what does this query do with your indexes, and what does it cost?"
+  3. Race conditions and security logic. Typical examples:
+     - Two admins edit the same schedule at once, and one change silently
+       overwrites the other (a "lost update"). Fixes: optimistic locking with a
+       version column, or SELECT … FOR UPDATE.
+     - An admin revokes a badge while a swipe is being checked. Which one wins,
+       and how quickly does the revocation reach the door controller?
+     - Business rules like "anti-passback" (a badge can't enter twice without
+       exiting), lockdown mode overriding every schedule, or schedules crossing
+       daylight-saving changes.
+     - Be ready to discuss transaction isolation levels (read committed vs.
+       repeatable read vs. serializable), unique constraints as a concurrency
+       guard, and the tradeoff between failing closed and failing open when the
+       database is unreachable. For a door, failing closed (staying locked) is
+       usually the safe default.
+
+  Q2: The device status dashboard
+
+  Setup: Verkada has a very large fleet of devices (cameras, door controllers,
+  sensors). Each one sends a heartbeat "ping" about once a minute. Customers
+  want a dashboard showing, up to the minute, how many devices are online,
+  probably per organization or site.
+
+  The double-counting bug
+
+  The prompt says "preventing deduplication." That's almost certainly a typo for
+  preventing double-counting, which you do by deduplicating.
+
+  The naive design adds one to a counter for every ping that arrives:
+
+  ping from cam-A → online_count += 1
+  ping from cam-A → online_count += 1   ← firmware bug, same minute
+  ping from cam-B → online_count += 1
+  => dashboard says 3 online, but only 2 devices exist
+
+  Buggy firmware sometimes sends 2 or more pings per minute. If you count pings,
+  you overstate how many devices are online. You might even show 120% online.
+  The fix is to count distinct devices seen in the time window, not pings. In
+  other words, every write has to be idempotent: a repeated ping from the same
+  device must change nothing.
+
+  Cheap ways to do that, from simplest to most compact:
+
+  ┌───────────────┬───────────────────────────────┬────────────────────────┐
+  │   Approach    │         How it works          │ Why duplicates don't   │
+  │               │                               │         matter         │
+  ├───────────────┼───────────────────────────────┼────────────────────────┤
+  │ Last-seen     │ device_id → last_seen_ts;     │ Overwriting a          │
+  │ timestamp     │ online means last_seen > now  │ timestamp is           │
+  │               │ - 60s                         │ idempotent             │
+  ├───────────────┼───────────────────────────────┼────────────────────────┤
+  │ Redis sorted  │ ZADD org:42 <ts> device_id,   │ ZADD on an existing    │
+  │ set per org   │ then ZCOUNT over the last     │ member only updates    │
+  │               │ 60s; trim old entries         │ its score              │
+  ├───────────────┼───────────────────────────────┼────────────────────────┤
+  │ Set per       │ SADD org:42:min:1203          │ Sets ignore duplicate  │
+  │ minute bucket │ device_id, then SCARD, with a │ members                │
+  │               │  TTL on the key               │                        │
+  ├───────────────┼───────────────────────────────┼────────────────────────┤
+  │ Bitmap per    │ Give each device a dense      │ Setting a bit that's   │
+  │ minute        │ integer ID; SETBIT            │ already 1 is a no-op;  │
+  │ (cheapest)    │ org:42:min:1203 <id> 1, then  │ costs 1 bit per device │
+  │               │ BITCOUNT                      │                        │
+  └───────────────┴───────────────────────────────┴────────────────────────┘
+
+  Edge cases worth raising:
+  - Window definition. A fixed per-minute bucket can miss a device that pinged
+    at 0:59 and 2:01. A sliding window, or "online = seen in the last N
+    seconds," is more forgiving.
+  - Clocks. Use the server's receive time, not the device's clock, because
+    device clocks drift.
+  - Late or out-of-order pings.
+  - Separate the write path from the read path. Many devices write, few people
+    read the dashboard. Don't recompute on every page load; precompute or cache
+    the result every few seconds.
+
+  "As cheaply as possible" is a hint that you shouldn't reach for Kafka plus a
+  time-series database first. An in-memory store with idempotent writes is
+  enough.
+
+  Part B: percentages to one decimal place
+
+  Once the display is a percentage like "97.3% online," exact counts are no
+  longer strictly required. The interviewer probably wants you to consider
+  approximation (HyperLogLog, sampling) to cut memory and compute.
+
+  The strong answer is to do the math before accepting approximation:
+  - One decimal place means the error must stay under about 0.05 percentage 
+    points.
+  - HyperLogLog has roughly 0.8% relative error. For an org with 1M devices,
+    that's about ±8,000 devices, or about ±0.8 points. That's too inaccurate.
+  - For small orgs (under about 1,000 devices), one device is already 0.1%, so
+    you need exact counts anyway.
+  - The denominator also matters: online / total registered devices. You need a
+    reliable source for the total, and you should cap the result at 100% in case
+    of bad data.
+
+  The real optimization is that a percentage is just BITCOUNT(online_bitmap) / 
+  BITCOUNT(registered_bitmap). Bitmaps are already tiny and exact, so the honest
+  answer may be "approximation doesn't buy much here, and here's why." Showing
+  that kind of judgment scores well.
+
+  Part C: back-of-the-envelope estimation
+
+  These are made-up numbers to show the shape of the reasoning. State your
+  assumptions out loud.
+
+  - Fleet: assume 10M devices × 1 ping/min ≈ 170K pings/sec on average. Multiply
+    by about 2× for buggy duplicates and about 2× for peaks, giving roughly
+    500–700K requests/sec.
+  - Bandwidth: about 200 bytes per ping × 600K/s ≈ 120 MB/s ≈ 1 Gbps of ingress.
+    That's manageable.
+  - Load balancer: the request rate isn't the expensive part. TLS handshakes and
+    connection count are. Recommend persistent connections (MQTT, gRPC streams,
+    or HTTP keep-alive) so you aren't doing a handshake every minute per
+    device. 10M open connections means many load balancer nodes.
+  - App servers: if one node handles about 20K simple requests/sec, you need
+    about 30 nodes, or about 50 with headroom and N+1 redundancy.
+  - Storage: a bitmap for 10M devices is 1.25 MB per minute, which is trivial.
+    Redis does about 100K+ operations/sec per shard, so you need about 6–10
+    shards, keyed by org.
+  - Bottlenecks to name:
+    - Reconnection storms: after an outage, every device reconnects at once. Fix
+      with randomized jitter and backoff.
+    - Hot keys: one huge customer concentrates load on a single shard.
+    - Redis is single-threaded per shard.
+    - TLS CPU cost.
+    - The dashboard read path, if it isn't cached.
+
+  If you'd like, I can run a mock interview on either question, or work through
+  a full answer to Q2 Part A as you'd say it out loud.
+
+✻ Brewed for 48s · done 2:25 PM
+
+❯ For part A, why is in-memory store enough? In-memory meaning redis?           
+
+⏺ Yes. By "in-memory store" I mean Redis or something like it (Memcached,
+  Valkey, DragonflyDB). Redis is the usual choice because its sets, sorted sets
+  and bitmaps already have the duplicate-ignoring behavior you need.
+
+  Why in-memory is enough
+
+  The question is really whether this data needs a durable database like
+  Postgres. It doesn't, for four reasons.
+
+  1. The data expires quickly. "Is device X online right now?" only depends on
+  the last minute or so. A ping from 10 minutes ago is useless for the live
+  dashboard, so there's nothing long-term to store.
+
+  2. Losing it is cheap, because it rebuilds itself. This is the key argument.
+  If Redis crashes and loses everything, every device pings again within about
+  60 seconds and the state is fully rebuilt. The cost is a minute of bad
+  dashboard data, not lost customer data. Durable storage is for data you can't
+  regenerate, and this you can.
+
+  3. It's small. One bit per device in a bitmap, or roughly 100 bytes per device
+  in a sorted set. Even 10M devices fit in a few MB to about 1 GB of RAM, so
+  you don't need disk.
+
+  4. The write rate is high, and in-memory is the cheap way to handle it. About
+  170K–600K writes per second is hard and expensive for Postgres: write-ahead
+  logging, index updates, vacuum, many shards. Redis handles about 100K+ simple
+  operations per second per shard, so a handful of shards covers it. "As cheaply
+  as possible" points straight at this.
+
+  Why a shared store, not each server's own memory
+
+  "In-memory" could also mean "keep a hashmap inside each app server."
+  Interviewers like to probe this. The problem: behind a load balancer, cam-A's
+  first ping may hit server 1 and its duplicate may hit server 2. Each server
+  sees only one ping, so neither detects the duplicate, and adding up the
+  servers' counts double-counts again.
+
+  There are two fixes:
+  - A shared Redis. Every server writes to the same place, so duplicates
+    collapse no matter which server received them.
+  - Route by device ID. Use consistent hashing so the same device always lands
+    on the same server. This works, but it's more fragile when servers are added
+    or removed.
+
+  Redis is the simpler answer.
+
+  Caveats to raise yourself
+
+  Naming these shows judgment:
+
+  - Show "unknown" instead of 0% after a Redis restart. An empty store makes it
+    look like everything went offline, which could trigger false alerts. Use a
+    replica with automatic failover, and treat the first minute after a restart
+    as "warming up."
+  - Store history in a durable database. If the product also wants "uptime over
+    the last 30 days," have a small job write one aggregated row per org per
+    minute, e.g. (org_id, minute, online_count, total). That's a tiny write
+    load, very different from writing every ping. In short: Redis holds the live
+    state, and the database holds the history.
+  - Don't recount on every dashboard load. Many devices write but few people
+    view the dashboard, so compute the counts every few seconds and serve the
+    cached result.
+
+  A one-sentence version for the interview: "The live online state can be 
+  rebuilt within one ping interval, so durability buys nothing. I'd keep it in 
+  Redis with idempotent writes, and only save per-minute totals to a database 
+  for history."
+
+✻ Worked for 15s · done 3:47 PM
+
+❯ For #3, how did you get from 1 bit to 100 bytes per device?                   
+
+⏺ Those two numbers come from two different data structures. The bitmap costs 1
+  bit per device and the sorted set costs about 100 bytes per device. The gap
+  comes from what each one actually stores.
+
+  Bitmap: 1 bit per device
+
+  A bitmap is one long row of bits. Each device gets a small, sequential integer
+  ID (cam-A = 0, cam-B = 1, cam-C = 2, …), and its bit at that position means
+  "seen this minute":
+
+  position:  0 1 2 3 4 5 ...
+  bits:      1 0 1 1 0 1 ...
+
+  - The device ID is never stored. It's implied by the position.
+  - No timestamp is stored, just yes or no for this time bucket.
+  - 10M devices = 10M bits = 1.25 MB per minute bucket.
+
+  The catch: you need a lookup table from real device IDs to those dense
+  integers, and that lives in your database. Also, the bitmap's size depends on
+  the largest ID used, not on how many devices are set. If one org's devices
+  have IDs near 9,000,000, that org's bitmap costs about 1.1 MB even if it has
+  only 50 devices. So you'd number devices within each org.
+
+  Sorted set: about 100 bytes per device
+
+  A sorted set stores the real device ID and a timestamp, plus the indexing
+  structures that make lookups fast. Rough breakdown per entry:
+
+  ┌───────────────────────────────────────────────────────────┬─────────────┐
+  │                           Piece                           │  Approx.    │
+  │                                                           │    bytes    │
+  ├───────────────────────────────────────────────────────────┼─────────────┤
+  │ Device ID string (e.g. a 36-char UUID) plus string header │ ~40         │
+  ├───────────────────────────────────────────────────────────┼─────────────┤
+  │ Score (the timestamp, an 8-byte double)                   │ 8           │
+  ├───────────────────────────────────────────────────────────┼─────────────┤
+  │ Skip-list node (pointers that keep entries sorted by      │ ~25–40      │
+  │ time)                                                     │             │
+  ├───────────────────────────────────────────────────────────┼─────────────┤
+  │ Hash-table entry and bucket (lets you look up a device's  │ ~25–35      │
+  │ score directly)                                           │             │
+  ├───────────────────────────────────────────────────────────┼─────────────┤
+  │ Memory-allocator rounding                                 │ some        │
+  ├───────────────────────────────────────────────────────────┼─────────────┤
+  │ Total                                                     │ ~100–150    │
+  └───────────────────────────────────────────────────────────┴─────────────┘
+
+  "100 bytes" is a rounded rule of thumb, not an exact figure. In the interview
+  you'd say "on the order of 100 bytes per entry," which is the right level of
+  precision. (Redis packs very small sets of under about 128 entries more
+  compactly, but at scale the estimate holds.)
+
+  10M devices × ~100 bytes ≈ 1 GB.
+
+  The tradeoff
+
+  ┌───────────────┬──────────────────────────────────┬───────────────────────┐
+  │               │              Bitmap              │      Sorted set       │
+  ├───────────────┼──────────────────────────────────┼───────────────────────┤
+  │ Memory for    │ ~1.25 MB per bucket              │ ~1 GB                 │
+  │ 10M devices   │                                  │                       │
+  ├───────────────┼──────────────────────────────────┼───────────────────────┤
+  │ What it tells │ Seen in this minute bucket: yes  │ The exact last-seen   │
+  │  you          │ or no                            │ time of each device   │
+  ├───────────────┼──────────────────────────────────┼───────────────────────┤
+  │               │ Fixed buckets (combine 2 buckets │ Sliding window ("seen │
+  │ Window        │  with OR to smooth the minute    │  in the last 60s")    │
+  │               │ edges)                           │                       │
+  ├───────────────┼──────────────────────────────────┼───────────────────────┤
+  │ Needs         │ Dense integer IDs                │ Nothing extra         │
+  └───────────────┴──────────────────────────────────┴───────────────────────┘
+
+  Both handle duplicate pings for free. Setting a bit that's already 1 changes
+  nothing, and ZADD on an existing member just updates its timestamp.
+
+  For the interview, you could start with the sorted set because it's simpler
+  and 1 GB of RAM is cheap. Then offer the bitmap as the optimization when the
+  interviewer pushes on cost or scale. Going from simple to optimized, and
+  explaining the tradeoff, is what they're looking for.
+
+✻ Crunched for 16s · done 3:50 PM
+
+❯ But how I would I know 100 byte to estimate? Do I need to know how redis does 
+  sorted set?                                                                   
+
+⏺ No, you don't need to know Redis internals. Interviewers don't expect it. The
+  100-byte figure comes from rough reasoning that works for any in-memory store.
+
+  Reason from what you have to store
+
+  Step 1: Add up the actual data. You know this from the problem itself:
+  - Device ID: a UUID is 16 bytes in binary or 36 as text, so call it about 32.
+  - Timestamp: 8 bytes.
+  - That's about 40–50 bytes of real data.
+
+  Step 2: Roughly double it for overhead. Any data structure that finds things
+  quickly (hash tables, trees, sorted lists) stores extra pointers alongside
+  your data, at 8 bytes each. A rough default is that overhead is about the same
+  size as the data, so ~50 bytes becomes ~100 bytes.
+
+  Step 3: Round to an easy number. 100 is easy to multiply: 10M × 100 bytes = 1
+  GB.
+
+  That's all there is to it. Out loud, it sounds like:
+
+  ▎ "Each entry is a device ID and a timestamp, roughly 50 bytes. With pointer 
+  ▎ overhead, call it 100 bytes. 10 million devices is about 1 GB."
+
+  Why being off by 2× doesn't matter
+
+  Estimation is about orders of magnitude, not exact figures. The real question
+  is whether this fits in RAM on a single machine (GB scale) or needs a
+  distributed system (TB scale). Check how sensitive the answer is:
+
+  ┌─────────────────────────────┬──────────────────────┬───────────────────┐
+  │ If the true cost per entry  │    Total for 10M     │    Conclusion     │
+  │             is              │       devices        │                   │
+  ├─────────────────────────────┼──────────────────────┼───────────────────┤
+  │ 50 bytes                    │ 0.5 GB               │ Fits in RAM       │
+  │                             │                      │ easily            │
+  ├─────────────────────────────┼──────────────────────┼───────────────────┤
+  │ 100 bytes                   │ 1 GB                 │ Fits in RAM       │
+  │                             │                      │ easily            │
+  ├─────────────────────────────┼──────────────────────┼───────────────────┤
+  │ 300 bytes                   │ 3 GB                 │ Still fits easily │
+  └─────────────────────────────┴──────────────────────┴───────────────────┘
+
+  Even if your guess is 3× off, the design decision is the same. You can say
+  that directly: "Even if I'm off by a few times, it's a few GB, which fits 
+  comfortably in memory." That shows you understand what the estimate is for.
+
+  A few numbers worth memorizing
+
+  These cover most estimation questions:
+
+  - A pointer or a 64-bit integer: 8 bytes
+  - A UUID: 16 bytes binary, 36 as text
+  - A timestamp: 8 bytes
+  - Per-entry overhead in a hash map or index: about the same as the data, so
+    double it
+  - A server's RAM: 64–256 GB is typical
+  - Redis on one shard: ~100K operations per second
+  - 1 million × 1 KB = 1 GB, and 1 billion × 1 KB = 1 TB
+
+  If you don't know a number, state your assumption and move on: "I'll assume 
+  about 100 bytes per entry; I can refine that if it matters." Interviewers care
+  that you state assumptions clearly and check whether they affect the
+  decision, not that you know Redis's skip-list node size.
+
+✻ Worked for 13s · done 3:54 PM
+
+❯ how did you get 16 bytes in binary to 36 as text                              
+
+⏺ A UUID is a 128-bit number. 128 bits ÷ 8 bits per byte = 16 bytes. That's the
+  binary form, the number stored as raw bytes.
+
+  The text form writes that same number in hexadecimal (digits 0–9 and a–f), the
+  way you usually see it:
+
+  550e8400-e29b-41d4-a716-446655440000
+
+  - One hex character represents 4 bits, so one byte (8 bits) takes 2 
+    characters.
+  - 16 bytes × 2 = 32 hex characters.
+  - The standard format adds 4 hyphens to split it into groups of 8-4-4-4-12.
+  - 32 + 4 = 36 characters, and each character takes 1 byte as plain ASCII text.
+
+  So it's the same value either way: 16 bytes in binary, 36 bytes as text, a bit
+  over twice the size. The general rule is that hex text is twice the size of 
+  the raw bytes, because each character carries only half a byte of information.
+
+  In practice, many systems store IDs as text strings because they're easier to
+  read and debug. Postgres's uuid type stores the 16-byte form, while a VARCHAR
+  column stores 36. In an interview, either number is fine. Pick one and say
+  which.
+
+✻ Cooked for 17s · done 3:55 PM
+
+❯ What Can you talk more about persistent connections. What are gRPC streams,   
+  MQTT or http keep-alive? I know of websocket and SSE for persistent           
+  connections between server and client                                         
+
+⏺ The problem persistent connections solve
+
+  Without one, every ping from a device does this:
+
+  1. TCP handshake         (1 network round trip)
+  2. TLS handshake         (1–2 round trips, plus expensive public-key crypto on
+  the server)
+  3. Send the ping         (the ~200 bytes you actually care about)
+  4. Close the connection
+
+  At 10M devices pinging once a minute, that's about 170K TLS handshakes per 
+  second. The handshake's cryptography is the expensive part for servers and
+  load balancers, much more than the ping itself.
+
+  A persistent connection does steps 1 and 2 once and keeps the connection open.
+  Every later ping is just a small encrypted message on a connection that
+  already exists.
+
+  You already know two ways to do this. WebSocket gives you a two-way channel,
+  and SSE gives you a one-way stream from server to client. The three options I
+  mentioned are other ways to get the same result.
+
+  HTTP keep-alive
+
+  This is the simplest option: reuse the same TCP+TLS connection for several 
+  ordinary HTTP requests.
+
+  - It's on by default in HTTP/1.1. The client just doesn't close the connection
+    after a response.
+  - The device still sends a normal POST /heartbeat each minute, just over the
+    existing connection.
+  - It's still request/response: the client asks and the server answers. The
+    server can't push anything on its own.
+  - Every request still carries full HTTP headers, often hundreds of bytes,
+    which can be larger than the ping data itself.
+  - Gotcha: load balancers and servers close idle connections after a timeout,
+    commonly about 60 seconds. If devices ping every 60 seconds, connections may
+    get closed just before each ping. The idle timeout must be longer than the
+    ping interval.
+
+  It's the least effort to adopt, since it's basically your existing REST API,
+  but also the least efficient of the three.
+
+  gRPC streams
+
+  gRPC is a framework for calling functions on another machine. It runs over
+  HTTP/2 and encodes messages with Protocol Buffers, a compact binary format
+  with a defined schema.
+
+  It supports normal request/response calls, but also streams:
+  - Client streaming: the client sends many messages on one call.
+  - Server streaming: the server sends many messages on one call. This is like
+    SSE.
+  - Bidirectional streaming: both sides send whenever they like. This is like
+    WebSocket.
+
+  For heartbeats, a device opens one long-lived stream and sends a small binary
+  heartbeat message every minute. The server can push commands back on the same
+  stream ("update firmware", "change config").
+
+  You can think of it as WebSocket with a typed schema and binary encoding. It's
+  common for service-to-service communication and for devices.
+
+  Gotcha: load balancers spread connections, not messages. A long-lived stream
+  stays pinned to one server, so a server added later gets no traffic until
+  devices reconnect. A common fix is to give connections a maximum age, so
+  devices reconnect every hour or so and redistribute.
+
+  MQTT
+
+  MQTT is a publish/subscribe messaging protocol designed specifically for IoT:
+  low-power devices on unreliable networks.
+
+  - Devices keep one TCP connection to a broker, a server that routes messages.
+  - A device publishes to a topic such as devices/cam-A/heartbeat, and backend
+    services subscribe to the topics they care about.
+  - The headers are tiny, as small as 2 bytes, compared with hundreds for HTTP.
+
+  Two features fit this problem especially well:
+
+  1. Built-in keepalive. The protocol has its own ping messages
+     (PINGREQ/PINGRESP), so the broker knows whether a device is still
+     connected.
+  2. Last Will and Testament. When a device connects, it registers a message to
+     be published if it disconnects unexpectedly. If the device loses power, the
+     broker publishes cam-A is offline automatically. You get offline detection
+     without writing it yourself.
+
+  It also has delivery guarantees ("QoS") that connect directly to the
+  double-counting bug:
+  - QoS 0, at most once: may lose messages, never duplicates.
+  - QoS 1, at least once: never loses messages, but may deliver duplicates.
+  - QoS 2, exactly once: no loss and no duplicates, but costs extra round trips.
+
+  This is worth mentioning in the interview. Even with no firmware bug, an "at
+  least once" system will produce duplicates, so the consumer must be idempotent
+  anyway. Most real systems pick at-least-once delivery with idempotent
+  processing because exactly-once is expensive. That's a strong point to make.
+
+  Comparison
+
+  HTTP keep-alive
+  Direction: Client asks, server answers
+  Where it's used: Any HTTP API
+  Overhead per message: High (full headers)
+  Notes: Easiest to adopt
+  ────────────────────────────────────────
+  SSE
+  Direction: Server → client only
+  Where it's used: Browsers
+  Overhead per message: Low, text only
+  Notes: Can't send heartbeats from the device
+  ────────────────────────────────────────
+  WebSocket
+  Direction: Both ways
+  Where it's used: Mostly browsers, works anywhere
+  Overhead per message: Low
+  Notes: No built-in schema or delivery guarantees
+  ────────────────────────────────────────
+  gRPC stream
+  Direction: Both ways
+  Where it's used: Service-to-service, devices
+  Overhead per message: Low, binary
+  Notes: Typed schema; needs HTTP/2-aware load balancers
+  ────────────────────────────────────────
+  MQTT
+  Direction: Pub/sub through a broker
+  Where it's used: IoT devices
+  Overhead per message: Very low
+  Notes: Keepalive, last will, and delivery levels built in
+
+  For a camera fleet, MQTT or gRPC streams are the natural answers. WebSocket
+  would also work. SSE doesn't fit because the device needs to send data.
+
+  What persistent connections cost
+
+  The interviewer may push here, which feeds into Part C:
+
+  - Memory per connection. Each open connection holds kernel buffers and TLS
+    state, roughly 10–50 KB. 10M connections × ~20 KB ≈ 200 GB spread across
+    your fleet, so you're sizing servers by connection count rather than
+    requests per second. A tuned server holds roughly 100K–1M connections.
+  - Reconnection storms. If a server or load balancer restarts, every device on
+    it reconnects at once, and each reconnect is a full TLS handshake. Devices
+    should retry with random jitter and exponential backoff.
+  - Uneven load. As with gRPC above, long-lived connections don't rebalance on
+    their own.
+  - You still need heartbeats. A connection can die without either side
+    noticing, for example when a network device in between silently drops it.
+    Without periodic messages, the server would think a dead device is still
+    connected. Keepalive pings catch this.
+
+  A one-line summary for the interview: "Devices keep a persistent connection, 
+  like MQTT or a gRPC stream, so we pay the TLS handshake once instead of every 
+  minute. Delivery is at-least-once, so the consumer is idempotent and 
+  duplicates from bugs or retries collapse naturally."
+
+✻ Sautéed for 31s · done 3:58 PM
+
+❯ If backend also needs to send message back to the client, how does it know    
+  which broker has the client connection if the load balancer randomly assigns  
+  the server when client first connects                                         
+
+⏺ The backend needs a lookup table of which server each device is connected to.
+  This is a standard problem, usually called connection routing or a session 
+  registry. There are a few ways to handle it.
+
+  1. A connection registry (the standard answer)
+
+  When a device connects, the server that accepted the connection (often called
+  a gateway) records it in a shared store such as Redis:
+
+  device:cam-A → { node: "gateway-17", conn_id: "abc123", connected_at: ... }
+
+  To send a message:
+
+  Backend ──1. look up cam-A──▶ Redis  → "gateway-17"
+  Backend ──2. send command──▶ gateway-17 (internal RPC)
+  gateway-17 ──3. write to the open connection──▶ cam-A
+
+  The hard part is that the registry entry can be out of date:
+
+  - The device reconnected somewhere else. cam-A drops and reconnects to
+    gateway-4, but the entry still says gateway-17. Fixes:
+    - Overwrite the entry on every new connection, so the latest connection
+      wins.
+    - Store a conn_id with the entry. When a connection closes, the gateway
+      deletes the entry only if the conn_id still matches, so an old connection
+      closing late can't remove the new one's entry. This is a
+      compare-and-delete, the same race-condition pattern as in Q1.
+    - If gateway-17 receives a command for a device it no longer holds, it
+      replies "not here," and the backend looks up the entry again and retries.
+  - The gateway crashed and never cleaned up its entries. Give each entry a TTL
+    that gets refreshed by the device's heartbeats. If the heartbeats stop, the
+    entry expires on its own.
+
+  This ties back to the heartbeat design. The ping that marks a device online
+  can also refresh its registry entry.
+
+  2. Deterministic routing (no lookup needed)
+
+  Instead of storing where each device is, make placement predictable: route
+  each device to a specific gateway using hash(device_id), so the backend can
+  compute the same hash to find it.
+
+  - Pro: no registry to keep in sync.
+  - Con: the load balancer has to read the device ID before choosing a server,
+    which requires an application-level (L7) load balancer, or the device ID in
+    the TLS server name (SNI).
+  - Con: adding or removing a gateway moves devices to other gateways.
+    Consistent hashing limits how many move, but some still have to reconnect.
+
+  It's a reasonable alternative to mention, but the registry is more flexible.
+
+  3. Pub/sub between gateways
+
+  Every gateway subscribes to a channel on a shared message bus (Redis pub/sub,
+  Kafka, NATS):
+
+  - Broadcast to all gateways: the backend publishes "command for cam-A," every
+    gateway receives it, and only the one holding cam-A acts on it. Simple, but
+    every gateway processes every message, so it doesn't scale to large fleets.
+  - One channel per gateway: combine with the registry. Look up "cam-A is on
+    gateway-17," then publish to the gateway-17 channel. This is just option 1
+    with a message bus as the transport.
+
+  4. With MQTT, the broker cluster handles it
+
+  If you use MQTT, you get this for free. A clustered broker (EMQX, HiveMQ, or a
+  managed service like AWS IoT Core) keeps its own internal routing table of
+  which node holds which client and its subscriptions.
+
+  - Each device subscribes to devices/cam-A/commands.
+  - The backend publishes to that topic on any broker node.
+  - The cluster forwards the message to the node holding cam-A's connection.
+
+  Internally the broker is doing option 1. Saying so shows you know what's
+  underneath: "MQTT brokers solve this with a clustered session table, the same 
+  thing I'd build myself with a Redis registry."
+
+  The case to raise yourself: the device is offline
+
+  If cam-A isn't connected when you send a command, you can't just drop it if it
+  matters ("revoke this badge," "update firmware").
+
+  - Store pending commands in a database table with a command ID and a status.
+    When the device reconnects, it fetches anything outstanding. (MQTT's
+    persistent sessions do this at the protocol level.)
+  - Have the device acknowledge commands by ID. Until the backend receives the
+    acknowledgment, it can retry. Retries mean the device may receive the same
+    command twice, so commands must be idempotent. It's the same principle as
+    the double-counting bug, in the other direction.
+
+  A related pattern is the "shoulder tap": the push carries only a tiny "you
+  have updates" signal, and the device then fetches the actual data over a
+  normal API call. Then the push channel doesn't need to be reliable, because if
+  a tap is lost, the device catches up on its next regular check.
+
+  Summary for the interview
+
+  ▎ "Each gateway registers device → gateway, conn_id in Redis when a device 
+  ▎ connects, with a TTL refreshed by heartbeats. To send a message, the backend
+  ▎ looks up the gateway and sends it there over internal RPC. Stale entries 
+  ▎ are handled with compare-and-delete on conn_id plus retry-on-miss. Important
+  ▎ commands are stored and acknowledged so they survive the device being 
+  ▎ offline, and they're idempotent because retries cause duplicates. If we use 
+  ▎ MQTT, the broker cluster gives us this routing out of the box."
+
+✻ Worked for 24s · done 4:03 PM
+
+❯ With MQTT, does each message need to specify the topic so it goes to the      
+  right server that is listening? Can there be multiple topics?                 
+
+⏺ Yes, every MQTT message carries a topic, and there can be as many topics as
+  you want. One correction to the mental model first: the topic doesn't direct a
+  message to a particular server. It directs it to whoever has subscribed, and
+  the broker works out who that is.
+
+  Every message includes its topic
+
+  Each publish message contains:
+  - Topic: a string such as devices/cam-A/heartbeat
+  - Payload: the actual bytes (the publisher picks the format, e.g. JSON or
+    protobuf)
+  - QoS level, plus a few flags
+
+  The publisher never names a recipient and doesn't know who, if anyone, is
+  listening. The broker compares the topic against every client's subscriptions
+  and delivers a copy to each match:
+
+  cam-A ──PUBLISH "devices/cam-A/heartbeat"──▶ Broker
+                                                 │ checks subscriptions
+                           ┌─────────────────────┼─────────────────────┐
+                           ▼                     ▼                     ▼
+                status service          audit logger          (nobody else 
+  matches,
+     subscribed "devices/+/heartbeat"   subscribed "devices/#"   so nothing else
+  happens)
+
+  So it's closer to tagging a message with a label than addressing it to
+  someone. One message can reach zero, one or many subscribers.
+
+  Topics are just strings, and you can have unlimited numbers of them
+
+  - You don't create topics ahead of time. A topic exists as soon as someone
+    publishes or subscribes to it.
+  - They're arranged in levels separated by /, like file paths.
+  - A client can publish to any number of topics and subscribe to any number of
+    topic patterns.
+
+  A realistic design for a device fleet:
+
+  orgs/{org}/devices/{device}/heartbeat     device → backend
+  orgs/{org}/devices/{device}/events        device → backend (motion detected, 
+  door opened)
+  orgs/{org}/devices/{device}/commands      backend → device
+  orgs/{org}/devices/{device}/commands/ack  device → backend
+
+  Wildcards in subscriptions
+
+  Subscribers can use patterns. Publishers can't; a published message always has
+  one exact topic.
+
+  - + matches exactly one level: orgs/+/devices/+/heartbeat means every device's
+    heartbeat in every org.
+  - # matches everything below a point, and must come last: orgs/42/# means
+    everything from org 42.
+
+  The backend status service subscribes once with a wildcard and receives
+  heartbeats from all 10M devices. Each device subscribes only to its own
+  .../cam-A/commands topic.
+
+  A detail that connects to double-counting: shared subscriptions
+
+  Suppose you run 30 instances of the status service, and each one subscribes to
+  orgs/+/devices/+/heartbeat. Every instance receives every heartbeat. That's
+  30 copies of each ping, which is the double-counting problem again (and 30×
+  the load).
+
+  The fix is a shared subscription (added in MQTT 5):
+
+  $share/status-service/orgs/+/devices/+/heartbeat
+
+  Every subscriber in the group status-service is treated as one logical
+  subscriber, and the broker gives each message to only one instance in the
+  group, spreading the load among them. It works like a consumer group in Kafka.
+
+  This is a good point to raise in an interview: "Use shared subscriptions so 
+  the backend instances split the heartbeats instead of each receiving all of 
+  them."
+
+  Two practical details
+
+  The topic is resent with every message. A string like
+  orgs/42/devices/cam-A/heartbeat is about 30 bytes, which can be bigger than
+  the heartbeat itself. MQTT 5 has topic aliases: the client sends the full
+  topic once with a small number attached, and later messages carry just the
+  number (2 bytes). For many small messages, this saves bandwidth.
+
+  Topics are your security boundary. Brokers enforce per-client access rules on
+  topics. Each device should be allowed only to:
+  - publish to orgs/{its org}/devices/{its own id}/...
+  - subscribe to orgs/{its org}/devices/{its own id}/commands
+
+  Otherwise a compromised camera could publish fake heartbeats for other
+  devices, or read another customer's commands. Verkada handles physical
+  security, so tying the topic design to tenant isolation would land well, and
+  it connects to the "security business logic" theme in Q1.
+
+  Short version
+
+  ▎ "Every MQTT message carries a topic string. The broker delivers it to every 
+  ▎ client whose subscription pattern matches, so publishers never address a 
+  ▎ server. Topics are free-form and unlimited; I'd organize them by 
+  ▎ org/device/message-type. Backend instances use a shared subscription so each
+  ▎ heartbeat is processed once, and per-topic access rules keep devices and 
+  ▎ tenants from reaching each other's data."
+
+✻ Baked for 19s · done 4:07 PM
+
+❯ I am confused. I thought it was the backend service subscripting to the       
+  topic. What do you mean by client's subscription/                             
+
+⏺ The confusion comes from the word "client," which means something different in
+  MQTT than in HTTP.
+
+  In MQTT, everything connected to the broker is a client
+
+  With HTTP you usually think of devices as clients and the backend as the
+  server. MQTT has only one server, the broker. Anything that connects to the
+  broker is an MQTT client, and that includes both the devices and the backend 
+  services:
+
+     cam-A (client)            ┐
+     cam-B (client)            │
+     door-controller (client)  ├──▶  BROKER  ◀──  status service (client)
+     ...                       │     (the only     command service (client)
+                               ┘      server)      audit logger (client)
+
+  The backend services don't receive connections from devices. They make their
+  own outbound connection to the broker, just like the devices do.
+
+  Publisher and subscriber are roles, not kinds of machine
+
+  Any client can publish, subscribe, or both, depending on the topic.
+
+  Heartbeats (device to backend):
+  - The device publishes to .../cam-A/heartbeat.
+  - The status service subscribes to .../+/heartbeat.
+
+  Commands (backend to device):
+  - The command service publishes to .../cam-A/commands.
+  - The device subscribes to .../cam-A/commands.
+
+  So you were right that the backend service subscribes to the heartbeat topics.
+  When I said "a client's subscription," I meant whichever client subscribed:
+  for heartbeats that's the backend, and for commands it's the device.
+
+  How this answers your earlier question
+
+  You asked how the backend finds the right server to send a command to. With
+  MQTT, the backend never connects to the device. It publishes to the broker,
+  and the broker already knows which connected client subscribed to
+  cam-A/commands, because cam-A told it when it connected. The device and the
+  backend never talk directly; the broker is always in the middle.
+
+✻ Baked for 7s · done 4:09 PM
+
+❯ Back to gRPC streaming. Is that different from gRPC? I know gRPC is           
+  persistent connection as I was looking into gRPC calls not load balancing     
+  properly                                                                      
+
+⏺ Yes, they're different things. gRPC is the framework, and streaming is one of 
+  its call types. The persistent connection you noticed comes from gRPC running
+  over HTTP/2, so it applies to every gRPC call, streaming or not. That's the
+  cause of your load-balancing problem.
+
+  Three layers
+
+  TCP connection (one, long-lived; gRPC calls this a "channel")
+   ├── call 1: GetUser()        ← unary: 1 request, 1 response, then done
+   ├── call 2: GetDoor()        ← unary
+   ├── call 3: Heartbeats()     ← streaming: stays open, many messages
+   │     ├── msg ─▶
+   │     ├── msg ─▶
+   │     └── msg ─▶ ...
+   └── call 4: GetSchedule()    ← unary
+
+  - Connection: a gRPC client opens one TCP+TLS connection to a server and keeps
+    reusing it. This is true for all call types.
+  - Call: each call is a lightweight HTTP/2 "stream" inside that connection.
+    Many calls can be in progress at the same time over the one connection
+    (HTTP/2 multiplexing).
+  - Messages: a unary call has one request and one response. A streaming call
+    can carry many messages in either direction.
+
+  gRPC has four call types:
+
+  ┌────────────────┬───────────┬───────────┬────────────────────────────────┐
+  │      Type      │  Client   │  Server   │            Example             │
+  │                │   sends   │   sends   │                                │
+  ├────────────────┼───────────┼───────────┼────────────────────────────────┤
+  │ Unary          │ 1         │ 1         │ GetUser(id), like a normal     │
+  │                │           │           │ REST call                      │
+  ├────────────────┼───────────┼───────────┼────────────────────────────────┤
+  │ Server         │ 1         │ many      │ Subscribe to updates, like SSE │
+  │ streaming      │           │           │                                │
+  ├────────────────┼───────────┼───────────┼────────────────────────────────┤
+  │ Client         │ many      │ 1         │ Upload a stream of heartbeats  │
+  │ streaming      │           │           │                                │
+  ├────────────────┼───────────┼───────────┼────────────────────────────────┤
+  │ Bidirectional  │ many      │ many      │ Device heartbeats plus         │
+  │                │           │           │ commands, like WebSocket       │
+  └────────────────┴───────────┴───────────┴────────────────────────────────┘
+
+  Why your calls weren't load balancing properly
+
+  This is a very common gRPC problem, especially on Kubernetes.
+
+  Most load balancers, including a default Kubernetes ClusterIP Service, work at
+  layer 4: they decide where to send each TCP connection when it opens, and
+  then step aside. A gRPC client opens one connection and sends all its calls
+  through it:
+
+  gRPC client ──one connection──▶ L4 LB ──▶ pod-1   (receives 100% of the calls)
+                                            pod-2   (idle)
+                                            pod-3   (idle)
+
+  The load balancer did its job. It spread connections, but there was only one
+  connection, so it couldn't spread the calls. Pods added later get nothing
+  until clients reconnect. With HTTP/1.1 REST you rarely notice this, because
+  clients tend to open many connections.
+
+  Fixes
+
+  1. A layer-7 (gRPC-aware) proxy. Envoy, Linkerd, Istio, NGINX with grpc_pass,
+     or AWS ALB in gRPC mode. These understand HTTP/2, so they can send each
+     call to a different backend even when calls share one client connection.
+     This is the most common fix.
+  2. Client-side load balancing. The client looks up every backend address and
+     opens a connection to each, then spreads calls across them itself. On
+     Kubernetes, that means a headless Service (DNS returns all pod IPs) plus
+     gRPC's round_robin load-balancing policy. This avoids a proxy hop, but
+     clients need to learn about new pods (DNS updates or service discovery).
+  3. MaxConnectionAge on the server. The server periodically closes connections
+     gracefully, forcing clients to reconnect and get rebalanced. This is a
+     simple safety net, and it's often combined with one of the other two.
+
+  How streaming makes it harder
+
+  With unary calls, a layer-7 proxy can send every call to a different backend,
+  which fully solves the problem.
+
+  With a long-lived stream, such as a device keeping one heartbeat stream open
+  for hours, even a layer-7 proxy can't help. The whole stream belongs to the
+  one backend it started on, and the proxy can't move it mid-stream. Load is set
+  when the stream starts and stays fixed after that. So for a fleet of devices
+  with persistent streams, you need fix 3 or something like it: streams or
+  connections with a maximum lifetime, so devices periodically reconnect with
+  jitter and spread across current servers.
+
+  This is the same "long-lived connections don't rebalance" problem from the
+  device discussion. You've already run into a small version of it in practice.
+
+  For the interview
+
+  ▎ "gRPC multiplexes all calls over one persistent HTTP/2 connection, so a 
+  ▎ layer-4 load balancer pins all of a client's traffic to one backend. I'd use
+  ▎ a gRPC-aware layer-7 proxy or client-side round-robin for unary calls. For 
+  ▎ long-lived device streams, even layer 7 can't rebalance mid-stream, so I'd 
+  ▎ cap connection age and have devices reconnect with jitter."
+
+  You could mention that you've seen gRPC calls fail to load balance in
+  practice. Firsthand experience with this kind of problem tends to impress
+  interviewers.
+
+✻ Cooked for 20s · done 4:11 PM
+
+❯ How does layer 7 proxy solve the load balancing call when gRPC still only     
+  opens 1 connection. Is it connecting to the proxy and the proxy is in front   
+  of all the pods?                                                              
+
+⏺ Yes, exactly. The client's one connection goes to the proxy, and the proxy
+  sits in front of all the pods with its own connections to each pod. So there
+  are two separate legs:
+
+                                         ┌──conn──▶ pod-1
+  gRPC client ══one connection══▶ PROXY ─┼──conn──▶ pod-2
+                                         └──conn──▶ pod-3
+           leg 1: client ↔ proxy         leg 2: proxy ↔ pods
+           (still just 1 connection)     (proxy keeps a connection to each pod)
+
+  The client still opens only one connection, but it ends at the proxy. Behind
+  the proxy, separate connections fan out to every pod, so the proxy can spread
+  calls across them.
+
+  What the proxy does with each call
+
+  1. It decrypts the traffic and reads the HTTP/2 data. A layer-7 proxy
+     terminates TLS (decrypts) and parses the HTTP/2 traffic, so it can see
+     individual calls. Each call starts with headers, including the method being
+     called, e.g. :path = /doors.DoorService/GetSchedule.
+  2. It picks a pod for each call, using round-robin, least-busy, or similar.
+  3. It forwards the call over its existing connection to that pod.
+  4. It sends the response back to the client. HTTP/2 labels each call with a
+     stream ID, and the proxy keeps track of which client stream matches which
+     pod stream, so responses go back to the right call.
+
+  Three calls from one client might go to three different pods:
+
+  client stream 1: GetUser()     ──▶ proxy ──▶ pod-1
+  client stream 3: GetDoor()     ──▶ proxy ──▶ pod-2
+  client stream 5: GetSchedule() ──▶ proxy ──▶ pod-3
+
+  Why a layer-4 load balancer can't do this
+
+  A layer-4 load balancer only sees raw TCP bytes. It doesn't parse HTTP/2, and
+  with TLS it can't even read the bytes. Pieces of different calls are
+  interleaved within that one byte stream, and the layer-4 balancer can't tell
+  where one call ends and the next begins. The only decision it can make is
+  where to send the whole connection, once, when it opens.
+
+  The layer-7 proxy can make a decision per call because it understands the
+  protocol. That's the difference between the layers: layer 4 works with TCP
+  connections, and layer 7 works with application messages such as HTTP requests
+  and gRPC calls.
+
+  Two ways to deploy the proxy
+
+  Central proxy: one shared pool of proxy instances, such as an Envoy deployment
+  or an ingress controller, that all clients connect to.
+  - Simple to run and reason about.
+  - It's an extra network hop, and the proxy pool has to scale with total
+    traffic.
+
+  Sidecar (service mesh): Istio and Linkerd run a small proxy inside each client
+  pod. The app connects to localhost, and its local proxy spreads calls to the
+  destination pods.
+  - No central bottleneck, and the extra hop is local, so it's cheap.
+  - More moving parts: a proxy in every pod, plus the mesh control plane.
+
+  Isn't the proxy now the single point of failure?
+
+  You run many proxy replicas, usually behind a plain layer-4 load balancer.
+  Each client's connection gets pinned to one proxy replica, but that's fine:
+  every proxy replica can reach every pod, so it doesn't matter which one a
+  client lands on. The pinning problem moves from the pods to the proxies, where
+  it doesn't matter.
+
+  Costs to mention in an interview
+
+  - Latency: an extra hop, typically under a millisecond within a datacenter.
+  - CPU: the proxy decrypts TLS and parses every call. If traffic between the
+    proxy and the pods must also be encrypted, it encrypts again.
+  - Operations: one more system to scale, monitor and configure.
+
+  The client-side load balancing option from before avoids all three by having
+  the client connect directly to every pod. In exchange, the client must learn
+  when pods are added or removed, so the work moves into the client library.
+
+✻ Cogitated for 17s · done 4:15 PM
+
+❯ So this one connection with gRPC is a http/2 thing or gRPC thing?             
+
+⏺ Both, but mostly HTTP/2. HTTP/2 makes one connection sufficient, and gRPC's
+  defaults make it actually use only one.
+
+  The HTTP/2 part: one connection carries everything
+
+  HTTP/2 was designed to send many requests over one connection at the same time
+  (multiplexing). That's a deliberate change from HTTP/1.1:
+
+  ┌───────────────────────┬──────────────────────────┬─────────────────────┐
+  │                       │     HTTP/1.1 (with       │       HTTP/2        │
+  │                       │       keep-alive)        │                     │
+  ├───────────────────────┼──────────────────────────┼─────────────────────┤
+  │ Connection reused?    │ Yes                      │ Yes                 │
+  ├───────────────────────┼──────────────────────────┼─────────────────────┤
+  │ Requests in progress  │ 1 (the next waits for    │                     │
+  │ at once on one        │ the previous)            │ Many (interleaved)  │
+  │ connection            │                          │                     │
+  ├───────────────────────┼──────────────────────────┼─────────────────────┤
+  │ What clients usually  │ Open a pool of several   │ Open one connection │
+  │ do                    │ connections to get       │  and multiplex      │
+  │                       │ parallelism              │                     │
+  └───────────────────────┴──────────────────────────┴─────────────────────┘
+
+  Any HTTP/2 client has the same load-balancing problem, not just gRPC. Browsers
+  also use one HTTP/2 connection per site.
+
+  That's why plain REST over HTTP/1.1 rarely shows the problem. Because each
+  connection handles one request at a time, clients open several connections,
+  and a layer-4 load balancer spreads those across pods. The spreading happens
+  by accident.
+
+  The gRPC part: defaults that make it stick to one
+
+  The gRPC client library adds two things on top:
+
+  1. Channels are long-lived. You create a channel once and reuse it for the
+     life of the process. The library keeps the connection open, reconnects if
+     it drops, and sends keepalive pings.
+  2. The default load-balancing policy is pick_first. Even if DNS returns
+     several backend IPs, the client connects to the first one that works and 
+     sends everything there. That's the gRPC-specific reason you see one
+     connection. Switching the policy to round_robin makes the client connect to
+     every address and rotate calls among them, which is the client-side load
+     balancing fix from before.
+
+  In one sentence
+
+  ▎ "HTTP/2 multiplexing means one connection can carry all of a client's calls,
+  ▎ and gRPC's long-lived channels plus its default pick_first policy mean it 
+  ▎ actually does, so a layer-4 load balancer only ever sees one connection to 
+  ▎ place."
+
+✻ Sautéed for 9s · done 4:16 PM
+
+❯ For distributing load of using hash(device_id) instead of a registry, how     
+  does layer 7 load balancer help? Where is device_id? Will it need to be in    
+  the header?                                                                   
+
+⏺ Yes, the device ID has to be somewhere the load balancer can read, and a
+  header is the most common place. A layer-7 load balancer helps because it can
+  read headers. A layer-4 load balancer sees only IP addresses, ports and
+  encrypted bytes, so it never sees the device ID.
+
+  Where the load balancer can find the device ID
+
+  After a layer-7 load balancer decrypts the TLS, it can read:
+
+  ┌──────────────┬─────────────────────────┬───────────────────────────────┐
+  │   Location   │         Example         │             Notes             │
+  ├──────────────┼─────────────────────────┼───────────────────────────────┤
+  │              │                         │ Most common. In gRPC,         │
+  │ Header       │ x-device-id: cam-A      │ "metadata" is sent as HTTP/2  │
+  │              │                         │ headers, so it's the same     │
+  │              │                         │ thing.                        │
+  ├──────────────┼─────────────────────────┼───────────────────────────────┤
+  │ URL path     │ /devices/cam-A/stream   │ Works well for WebSocket or   │
+  │              │                         │ REST.                         │
+  ├──────────────┼─────────────────────────┼───────────────────────────────┤
+  │ Client       │ Certificate identity    │ The best option for devices;  │
+  │ certificate  │ CN=cam-A                │ see the security section      │
+  │              │                         │ below.                        │
+  ├──────────────┼─────────────────────────┼───────────────────────────────┤
+  │              │ Inside the protobuf or  │ Load balancers generally      │
+  │ Message body │ JSON                    │ don't parse bodies, so avoid  │
+  │              │                         │ this.                         │
+  └──────────────┴─────────────────────────┴───────────────────────────────┘
+
+  Common load balancers support this directly:
+  - Envoy: the ring_hash or maglev policy with a hash policy on the x-device-id
+    header.
+  - NGINX: hash $http_x_device_id consistent;
+  - HAProxy: balance hdr(x-device-id)
+
+  For persistent connections, routing happens once
+
+  The load balancer makes its choice when the connection or stream starts:
+  - gRPC stream: the metadata sent when the stream opens includes x-device-id.
+    The proxy hashes it, picks gateway-17, and the whole long-lived stream stays
+    there.
+  - WebSocket: the initial HTTP upgrade request carries the header or path, and
+    the connection is routed once based on it.
+
+  After that, every heartbeat on that stream goes to the same gateway, so the
+  device ID is needed only at the start.
+
+  Security: don't trust a header the device chooses
+
+  A header is just text the client sends, so a compromised device could claim
+  x-device-id: cam-B.
+
+  For routing alone, lying just puts the device on a different gateway, which is
+  mostly harmless. But the gateway must never treat that header as proof of
+  identity.
+
+  The better approach is mutual TLS (mTLS): each device has its own certificate,
+  issued at manufacture, that contains its identity. The load balancer verifies
+  the certificate during the TLS handshake, extracts the device ID from it, and
+  hashes on that. Envoy can also pass the verified identity to the gateway in a
+  header (x-forwarded-client-cert). Now the routing key is something the device
+  can't forge. For a physical-security company that's the answer to give, and
+  it ties back to the security theme from Q1.
+
+  MQTT is not HTTP
+
+  If devices use MQTT, there are no HTTP headers. The device ID is the client ID
+  in MQTT's first message, the connect message. Your options:
+  - A load balancer that understands MQTT, such as HAProxy with a script, NGINX
+    Plus's MQTT module, or the broker vendor's own load balancer, which can hash
+    on that client ID.
+  - Hashing on the device ID from the client certificate, as above.
+  - Most often: let the MQTT broker cluster handle routing internally, so you
+    don't need hash-based routing at all.
+
+  The weakness of the hash approach
+
+  Both sides have to compute the same answer. The load balancer hashes cam-A to
+  gateway-17, and the backend must also compute gateway-17 when it wants to send
+  a command. That requires:
+  - the same hash algorithm on both sides, and
+  - the same list of gateways at the same moment.
+
+  When a gateway is added or crashes, the load balancer and the backend may
+  briefly disagree about the gateway list. The backend sends to gateway-17 while
+  the device has already reconnected to gateway-4. You still need a fallback
+  ("not here," then retry), which is exactly what the registry approach handles
+  cleanly.
+
+  That's why the registry is the more common answer in practice. It records
+  where each device actually is, rather than working out where it should be.
+  Hash routing is still worth mentioning as an alternative, along with this
+  tradeoff.
+
+  For the interview
+
+  ▎ "With hash routing, the device ID needs to be readable by a layer-7 load 
+  ▎ balancer: a header, the path, or ideally the identity from the device's mTLS
+  ▎ certificate so it can't be forged. The load balancer uses consistent 
+  ▎ hashing on it when the stream opens. The catch is that the backend has to 
+  ▎ compute the same hash over the same gateway list, which breaks briefly 
+  ▎ whenever gateways change, so I'd use a connection registry and keep hashing 
+  ▎ as an optimization."
+✻ Churned for 22s · done 4:18 PM
+
+❯ For the URL path approach, how does the request with different paths and      
+  device_id get routed to the same place                                        
+
+⏺ The load balancer doesn't hash the whole path. It extracts just the device ID 
+  part of the path and hashes that. Since every request from cam-A has the same
+  device ID, every request goes to the same place, whatever the rest of the path
+  says.
+
+  Example
+
+  GET  /devices/cam-A/heartbeat   →  extract "cam-A"  →  hash("cam-A")  →  
+  gateway-17
+  POST /devices/cam-A/events      →  extract "cam-A"  →  hash("cam-A")  →  
+  gateway-17
+  GET  /devices/cam-A/commands    →  extract "cam-A"  →  hash("cam-A")  →  
+  gateway-17
+  GET  /devices/cam-B/heartbeat   →  extract "cam-B"  →  hash("cam-B")  →  
+  gateway-4
+
+  If the load balancer hashed the full path, /devices/cam-A/heartbeat and
+  /devices/cam-A/events would produce different hashes and could go to different
+  gateways. Choosing which part of the request is the hash key is what makes
+  this work.
+
+  The URL design should put the device ID in a fixed position (here, the second
+  segment) so the load balancer can reliably extract it.
+
+  How the extraction is configured
+
+  These are illustrative. Exact syntax depends on the tool and version.
+
+  NGINX: pull the ID out with a pattern, then hash on it.
+  map $uri $device_id {
+      ~^/devices/(?<id>[^/]+)/   $id;
+  }
+  upstream gateways {
+      hash $device_id consistent;
+      server gateway-1;
+      server gateway-2;
+      # ...
+  }
+
+  HAProxy: take the third /-separated field of the path (the first field is the
+  empty string before the leading /).
+  http-request set-var(txn.dev) path,field(3,/)
+  balance hash var(txn.dev)
+
+  Envoy hashes most easily on a header, so a common approach is to copy the path
+  segment into a header first, or just have the client send x-device-id as
+  well.
+
+  Why "consistent"
+
+  The consistent keyword means consistent hashing. Each gateway owns a range on
+  a hash ring, and a key maps to whichever gateway owns its position. The
+  important property:
+  - Same key and same set of gateways means the same gateway every time.
+  - When a gateway is added or removed, only about 1/N of the keys move. With
+    ordinary hash % N, nearly every key would move to a different gateway
+    whenever N changes.
+
+  Separate requests vs. a persistent connection
+
+  - Separate requests (plain REST, one call per ping): each request is routed
+    independently, but they all land in the same place because the extracted key
+    is the same. Nothing is "remembered"; the hash is just deterministic.
+  - Persistent connection (WebSocket upgrade, gRPC stream): only the first
+    request's path matters. It's hashed once and everything after stays on that
+    connection.
+
+  Same-key routing is how the backend finds the device in the hash approach. It
+  computes hash("cam-A") over the same gateway list and gets gateway-17 too. The
+  same caveat applies: if the gateway list changes, the two sides can briefly
+  disagree.
+
+✻ Crunched for 14s · done 4:22 PM
+
+❯ No, I mean before that. How does it get routed to our load balancer in the    
+  first place? Is it by domain? And then by path?                               
+
+⏺ Yes, by domain first and then by path, with one more step after that. There
+  are three separate decisions in sequence: the domain gets the request to the 
+  load balancer, the domain plus path pick which group of servers, and the hash 
+  key picks one server in that group.
+
+  Example request: https://devices.example.com/devices/cam-A/heartbeat
+
+  Step 1: DNS gets the device to the load balancer
+
+  The device looks up devices.example.com in DNS and gets back the load 
+  balancer's IP address, not any server's. That's how the request reaches your
+  load balancer at all: you point the domain's DNS record at it.
+
+  At larger scale:
+  - DNS can return different IPs by region (GeoDNS), so a device in Europe goes
+    to the European load balancers.
+  - The "load balancer" is really many instances behind one IP address. Cloud
+    providers spread incoming connections across them; you just see one address.
+
+  Step 2: TCP and TLS connection to the load balancer
+
+  The device opens a connection to that IP on port 443 and starts TLS. In the
+  first TLS message, the device sends the hostname in plain text (SNI, Server
+  Name Indication). The load balancer uses it to choose which certificate to
+  present, because one load balancer often serves many domains.
+
+  Step 3: The domain and path pick a group of servers
+
+  Once TLS is set up, the load balancer decrypts the request and reads the Host
+  header (the domain) and the path. It matches them against its routing rules:
+
+  Host: devices.example.com, path /devices/*   →  gateway pool
+  Host: devices.example.com, path /firmware/*  →  firmware-download pool
+  Host: api.example.com,     path /*           →  API service pool
+  Host: app.example.com,     path /*           →  web frontend pool
+
+  So several domains can point to the same load balancer IP, and the Host header
+  plus path decide which backend service the request is for.
+
+  Step 4: The load-balancing policy picks one server in the group
+
+  Now the load balancer knows the request is for the gateway pool, which might
+  have 30 instances. Its policy for that pool picks one:
+  - Round-robin or least-busy: any instance will do.
+  - Hash on device ID: extract cam-A and hash it, giving gateway-17 (what we
+    discussed before).
+
+  The whole path
+
+  device
+    │ 1. DNS: devices.example.com → 203.0.113.10 (the load balancer)
+    ▼
+  load balancer (many instances behind that IP)
+    │ 2. TLS handshake; SNI selects the certificate
+    │ 3. Host + path rules → "gateway pool"
+    │ 4. hash("cam-A") within the pool → gateway-17
+    ▼
+  gateway-17
+
+  If you've used Kubernetes, an Ingress works the same way. Its rules match on
+  host and path to select a Service (steps 3 and 4), and DNS points the domain
+  at the ingress controller's address (step 1).
+
+✻ Worked for 14s · done 4:24 PM
+
+❯ So is DNS only for domains and subdomains? It doesn't usually handle paths?   
+
+⏺ Right. DNS only handles hostnames (domains and subdomains). It never sees
+  paths, and it can't.
+
+  Why DNS can't see paths
+
+  DNS runs before any connection exists, and the device asks it only one
+  question: "What's the IP address for devices.example.com?"
+
+  https://devices.example.com:443/devices/cam-A/heartbeat?x=1
+          └──── DNS sees ────┘    └──── DNS never sees any of this ────┘
+
+  The path, query string and headers belong to the HTTP request, which is sent
+  only after DNS has returned an IP and the connection is open. With HTTPS,
+  they're also encrypted, so only the server or load balancer that decrypts the
+  traffic can read them.
+
+  What DNS can do
+
+  - Map each hostname to IPs. Every subdomain is its own name, so
+    devices.example.com and api.example.com can point to completely different
+    places.
+  - Wildcards: *.example.com matches any subdomain.
+  - Aliases (CNAME): devices.example.com is another name for
+    lb-123.cloudprovider.com.
+  - Return different answers by region (GeoDNS) or by server health (failover).
+
+  What that means for design
+
+  ┌────────────────────────┬────────────────────────────────────────────────┐
+  │   Splitting traffic    │                    Done by                     │
+  │         by...          │                                                │
+  ├────────────────────────┼────────────────────────────────────────────────┤
+  │ Hostname (devices. vs  │ DNS can send them to different load balancers, │
+  │ api.)                  │  or the same load balancer can split on the    │
+  │                        │ Host header                                    │
+  ├────────────────────────┼────────────────────────────────────────────────┤
+  │ Path (/devices/* vs    │ Only a layer-7 load balancer or proxy, after   │
+  │ /firmware/*)           │ decrypting                                     │
+  ├────────────────────────┼────────────────────────────────────────────────┤
+  │ A value inside the     │ Only a layer-7 load balancer or proxy          │
+  │ request (device ID)    │                                                │
+  └────────────────────────┴────────────────────────────────────────────────┘
+
+  A practical consequence: if you ever want device traffic on completely
+  separate infrastructure (its own load balancers, its own region, or isolated
+  so a device problem can't take down the customer dashboard), give it its own 
+  subdomain. DNS can split by subdomain before any shared component is involved.
+  A path split always means the traffic first passes through the same load
+  balancer.
+
+  That's a good point for Part C: "Devices get their own hostname, 
+  devices.example.com, so device traffic can scale, fail and be rate-limited 
+  separately from the customer-facing API."
+
+✻ Cogitated for 10s · done 4:25 PM
+
+❯ I see. So even though I see domain and path in my browser address bar,        
+  underneath only the domain is visible to DNS and the path is part of the HTTP 
+  protocol                                                                      
+
+⏺ Yes, that's right. The URL in the address bar is a convenience for people. The
+  browser breaks it apart and hands each piece to a different layer:
+
+  https://devices.example.com:443/devices/cam-A/heartbeat?x=1
+  └─┬─┘   └────────┬────────┘ └┬┘ └──────────────┬──────────────┘
+  scheme       hostname       port      path + query
+
+  ┌──────────────────────────────┬───────────────────────────────────────────┐
+  │            Piece             │               Where it goes               │
+  ├──────────────────────────────┼───────────────────────────────────────────┤
+  │ https                        │ Which protocol to use, and the default    │
+  │                              │ port (443)                                │
+  ├──────────────────────────────┼───────────────────────────────────────────┤
+  │                              │ DNS lookup to get the IP; also sent as    │
+  │ devices.example.com          │ SNI in the TLS handshake and as the Host  │
+  │                              │ header in HTTP                            │
+  ├──────────────────────────────┼───────────────────────────────────────────┤
+  │ 443                          │ Which port to connect to on that IP       │
+  ├──────────────────────────────┼───────────────────────────────────────────┤
+  │ /devices/cam-A/heartbeat?x=1 │ Only the HTTP request itself: GET         │
+  │                              │ /devices/cam-A/heartbeat?x=1              │
+  └──────────────────────────────┴───────────────────────────────────────────┘
+
+  A related consequence for privacy: someone watching the network, such as your
+  ISP or the Wi-Fi operator, can usually see which hostname you're visiting
+  (from the DNS lookup and the SNI). They can't see the path or query, because
+  those travel only inside encrypted HTTPS. Newer standards (DNS over HTTPS, and
+  Encrypted Client Hello, which hides the SNI) are closing the hostname gap as
+  well.
+
+✻ Crunched for 6s · done 4:27 PM
+
+※ recap: You're preparing for Verkada's architecture interview, and we just finished on how requests get routed: DNS sees only the domain, then the load balancer routes by Host, path, and device-ID hash. Next, try a mock run of Q2 Part A out loud. (disable recaps in /config)
+
+❯ For back of the envelop math, my issue is knowing what is reasonable for a    
+  server. For example, how do I know Redis does about 100k+ operations/sec and  
+  thus I need 6-10 shards? Or how much a server can handle                      
+
+⏺ You don't need exact numbers. Interviewers want reasonable orders of 
+  magnitude, stated as assumptions, used consistently. You get there with a
+  small set of memorized numbers plus one way of deriving the rest.
+
+  1. Derive throughput from time per operation
+
+  Most "how much can a server handle" numbers come from one formula:
+
+  ▎ requests/sec ≈ number of cores ÷ CPU time per request
+
+  To use it, ask what work each request actually does:
+
+  ┌─────────────────────────────────┬────────┬─────────┬───────────────────┐
+  │         Kind of request         │  CPU   │  Per    │   Per 16-core     │
+  │                                 │  time  │  core   │      server       │
+  ├─────────────────────────────────┼────────┼─────────┼───────────────────┤
+  │ Trivial: parse a ping, one      │ ~0.1   │ ~10K/s  │ ~100K/s           │
+  │ Redis write                     │ ms     │         │ (theoretical)     │
+  ├─────────────────────────────────┼────────┼─────────┼───────────────────┤
+  │ Typical API: auth, JSON, one    │ ~1 ms  │ ~1K/s   │ ~10K/s            │
+  │ database query                  │        │         │                   │
+  ├─────────────────────────────────┼────────┼─────────┼───────────────────┤
+  │ Heavy: business logic, several  │ ~10 ms │ ~100/s  │ ~1K/s             │
+  │ queries, rendering              │        │         │                   │
+  └─────────────────────────────────┴────────┴─────────┴───────────────────┘
+
+  Real servers lose a lot to networking, garbage collection, logging and TLS, so
+  assume you'll reach maybe 20–50% of the theoretical number. That's why I used
+  "about 20K/s per node" for the simple heartbeat handler. It's a conservative
+  version of the first row.
+
+  Redis, derived the same way: Redis processes commands on a single thread, so
+  one shard uses about one core. A simple SET takes only a few microseconds of
+  real work, but the network handling around each command (reading the socket,
+  writing the reply) adds roughly 5–10 µs. 1 second ÷ ~10 µs ≈ 100K 
+  operations/sec per shard. With pipelining (batching many commands in one round
+  trip), that rises toward 1M/sec.
+
+  Then the shard count follows:
+  - 600K writes/sec peak ÷ 100K per shard = 6 shards
+  - Plan to run at about 60% load for safety, and to survive losing a shard: 6 ÷
+    0.6 ≈ 10, so about 10 shards.
+
+  2. Requests waiting on I/O: Little's law
+
+  If a request spends most of its time waiting on a database or another service,
+  CPU isn't the limit. The limit is how many requests can be in progress at
+  once:
+
+  ▎ requests in progress = requests/sec × latency
+
+  At 10K req/s, each waiting 50 ms on a database: 10,000 × 0.05 = 500 requests 
+  in progress at once. With an async server, that's fine. With 200 threads,
+  you're capped at 200 ÷ 0.05 = 4K req/s, no matter how many cores you have.
+
+  3. Numbers worth memorizing
+
+  These are rough values on modern hardware, good to within about 2–5×, which is
+  all an estimate needs.
+
+  Per server or node
+
+  ┌─────────────────────────────────────┬───────────────────────────────────┐
+  │              Component              │             Ballpark              │
+  ├─────────────────────────────────────┼───────────────────────────────────┤
+  │ App server, simple requests         │ 10K–50K req/s                     │
+  ├─────────────────────────────────────┼───────────────────────────────────┤
+  │ App server, typical API             │ 1K–10K req/s                      │
+  ├─────────────────────────────────────┼───────────────────────────────────┤
+  │ Redis, one shard                    │ ~100K ops/s (up to ~1M pipelined) │
+  ├─────────────────────────────────────┼───────────────────────────────────┤
+  │ Memcached (uses multiple threads)   │ ~1M ops/s                         │
+  ├─────────────────────────────────────┼───────────────────────────────────┤
+  │ Postgres/MySQL, simple indexed      │ ~10K–50K/s                        │
+  │ reads                               │                                   │
+  ├─────────────────────────────────────┼───────────────────────────────────┤
+  │ Postgres/MySQL, writes              │ ~1K–10K/s (more with batching)    │
+  ├─────────────────────────────────────┼───────────────────────────────────┤
+  │ Kafka broker                        │ ~100K–1M msgs/s, ~100+ MB/s       │
+  ├─────────────────────────────────────┼───────────────────────────────────┤
+  │ Full TLS handshakes                 │ ~1K–5K per core per sec           │
+  ├─────────────────────────────────────┼───────────────────────────────────┤
+  │ Open connections, tuned server      │ 100K–1M (~10–50 KB of memory      │
+  │                                     │ each)                             │
+  └─────────────────────────────────────┴───────────────────────────────────┘
+
+  Hardware
+
+  ┌────────────────┬────────────────────────────────────────────┐
+  │                │                  Ballpark                  │
+  ├────────────────┼────────────────────────────────────────────┤
+  │ Typical server │ 16–64 cores, 64–512 GB RAM                 │
+  ├────────────────┼────────────────────────────────────────────┤
+  │ Network card   │ 10–25 Gbps (10 Gbps ≈ 1.25 GB/s)           │
+  ├────────────────┼────────────────────────────────────────────┤
+  │ SSD            │ ~100K+ random reads/s, 1–3 GB/s sequential │
+  ├────────────────┼────────────────────────────────────────────┤
+  │ Spinning disk  │ ~100–200 random reads/s                    │
+  └────────────────┴────────────────────────────────────────────┘
+
+  Latency
+
+  ┌────────────────────────────────┬───────────┐
+  │                                │ Ballpark  │
+  ├────────────────────────────────┼───────────┤
+  │ Memory access                  │ ~100 ns   │
+  ├────────────────────────────────┼───────────┤
+  │ SSD random read                │ ~100 µs   │
+  ├────────────────────────────────┼───────────┤
+  │ Round trip within a datacenter │ ~0.5 ms   │
+  ├────────────────────────────────┼───────────┤
+  │ Round trip across regions      │ 50–150 ms │
+  └────────────────────────────────┴───────────┘
+
+  Time conversions
+
+  - 1 day ≈ 86,400 s ≈ 10⁵ seconds
+  - So 1M per day ≈ 12/s, and 1B per day ≈ 12K/s
+  - Peak ≈ 2–3× average
+
+  4. Standard adjustments
+
+  Apply these every time and say them out loud:
+  1. Average to peak: × 2–3.
+  2. Target utilization: plan for 50–70% of capacity, not 100%.
+  3. Redundancy: add one or two extra nodes (N+1) so losing a node doesn't cause
+     an outage.
+  4. Round to easy numbers. 6.4 becomes "about 10 with headroom."
+
+  5. How to present it
+
+  The structure matters more than the exact values:
+
+  ▎ "I'll assume a Redis shard handles about 100K simple operations a second, 
+  ▎ since it's single-threaded and each command costs around 10 microseconds 
+  ▎ including networking. Peak is about 600K writes a second, so that's 6 shards
+  ▎ at full load. With headroom and N+1, I'd plan for about 10. If benchmarks 
+  ▎ show 2× better, it's 5 shards instead of 10, and the design stays the same."
+
+  That last sentence matters. It shows you know the estimate is there to settle
+  a design question (one machine or many? fits in RAM or not?), not to be
+  precise.
+
+  Interview bonus: use your own experience
+
+  If you've ever looked at a dashboard at work showing something like "this
+  service handles 3K req/s on 4 pods at 40% CPU," use it: "In my experience, a 
+  typical service does about 1K req/s per pod." Numbers you've actually observed
+  carry more weight than memorized ones.
+
+  I can turn this into a one-page cheat sheet you can print and review before
+  the onsite if that would help.
+
+✻ Cogitated for 29s · done 4:55 PM
+
+❯ For the ballpark number of postgres, is that with respect to requests or data 
+  size?                                                                         
+
+⏺ They're throughput: queries or transactions per second, each one small and
+  simple. Data size is a separate dimension. It affects throughput indirectly,
+  and it has its own rough limits.
+
+  Throughput (what those numbers meant)
+
+  - ~10K–50K/s simple indexed reads: e.g. SELECT * FROM doors WHERE id = ?, one
+    row through an index, with the data in memory.
+  - ~1K–10K/s writes: e.g. single-row INSERT or UPDATE statements, each
+    committed separately.
+
+  Writes are slower mainly because every commit must be flushed to disk (written
+  to the write-ahead log and synced) before Postgres confirms it. What moves
+  the write number:
+
+  ┌────────────────────────┬────────────────────────────────────────────────┐
+  │         Factor         │                     Effect                     │
+  ├────────────────────────┼────────────────────────────────────────────────┤
+  │ Batching (multi-row    │ One flush covers many rows, so 100K+ rows/s is │
+  │ INSERT, COPY)          │  possible                                      │
+  ├────────────────────────┼────────────────────────────────────────────────┤
+  │ Number of indexes on   │ Each index is another write per row, so 5      │
+  │ the table              │ indexes make writes much slower                │
+  ├────────────────────────┼────────────────────────────────────────────────┤
+  │ Row size, triggers,    │ More work per write                            │
+  │ foreign-key checks     │                                                │
+  ├────────────────────────┼────────────────────────────────────────────────┤
+  │                        │ Relaxing them raises throughput at the cost of │
+  │ Durability settings    │  possibly losing the last few writes in a      │
+  │                        │ crash                                          │
+  └────────────────────────┴────────────────────────────────────────────────┘
+
+  A practical limit: Postgres uses a separate process per connection, so it
+  handles a few hundred connections well, not thousands. At high request rates
+  you put a connection pooler (PgBouncer) in front.
+
+  How data size affects throughput
+
+  The key question is whether the frequently used data (the "working set") fits 
+  in RAM.
+
+  - Fits in memory: an indexed lookup takes microseconds, and the throughput
+    numbers above apply.
+  - Doesn't fit: lookups go to disk (~100 µs on SSD, much worse on spinning
+    disks), and throughput drops.
+
+  A large table isn't necessarily slow. A 1-billion-row table can still do fast
+  lookups if the index and frequently read rows fit in RAM. What hurts is
+  queries that scan a lot of data, or random access across data far larger than
+  memory.
+
+  Data size rough limits
+
+  ┌──────────────┬──────────────────────────────────────────────────────────┐
+  │              │                         Ballpark                         │
+  ├──────────────┼──────────────────────────────────────────────────────────┤
+  │ A single     │                                                          │
+  │ Postgres     │ Comfortable from hundreds of GB to a few TB              │
+  │ node         │                                                          │
+  ├──────────────┼──────────────────────────────────────────────────────────┤
+  │ A single     │ Billions of rows is fine with good indexes; use          │
+  │ table        │ partitioning (e.g. by month) to keep indexes and cleanup │
+  │              │  manageable                                              │
+  ├──────────────┼──────────────────────────────────────────────────────────┤
+  │ When to      │ Many TB of data, writes beyond one node's capacity, or a │
+  │ scale out    │  working set far bigger than RAM. Then use read replicas │
+  │              │  (for reads), partitioning, or sharding                  │
+  └──────────────┴──────────────────────────────────────────────────────────┘
+
+  Estimate both, separately
+
+  For any database in an interview, check two things:
+
+  1. Throughput: operations/sec ÷ per-node capacity = how many nodes.
+  2. Storage: rows × bytes per row × retention period = total size. Does it fit
+     on one node, and does the working set fit in RAM?
+
+  Applied to the dashboard:
+  - Raw pings into Postgres: ~600K writes/s against ~10K per node. Throughput
+    rules it out. That's the numeric reason the live state goes in Redis.
+  - Per-minute history rows (org_id, minute, online, total): say 100K orgs ×
+    1,440 minutes/day ≈ 144M rows/day. Write rate is 144M ÷ 10⁵ s ≈ ~1.5K/s,
+    which one node handles easily, especially batched. Storage: at ~50 bytes/row
+    that's ~7 GB/day, about 2.5 TB/year. That starts to matter, so you'd
+    partition by day and keep minute-level data for a limited time (e.g. 30
+    days), then roll it up into hourly totals.
+
+  That last point, downsampling old data into coarser buckets, is a common
+  follow-up when interviewers ask about storing history.
+
+✻ Worked for 17s · done 5:01 PM
+
+※ recap: You're preparing for Verkada's architecture interview, and we've been working through the device-dashboard question, most recently how to estimate Postgres throughput and storage. Next, I'd suggest a mock run of Part A out loud. (disable recaps in /config)
