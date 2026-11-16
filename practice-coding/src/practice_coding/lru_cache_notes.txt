@@ -1,0 +1,1411 @@
+▗ ▗   ▖ ▖  Claude Code v2.1.325
+           Opus 5.5 · Claude Pro
+ ▘▘   ▝▝   ~/Development/2026-interview-practice
+
+⚠ Your login expires in 3 days · run /login to renew
+
+❯ <ide_opened_file>The user opened the file /Users/rebeccawong/Development/2026 
+  -interview-practice/practice-coding/src/practice_coding/lru_cache.py in the   
+  IDE. This may or may not be related to the current task.</ide_opened_file>    
+
+❯ I am expanding the class to be thread safe. I have as first pass used 1 lock  
+  that controls both read and write. Do I need a lock for size() as well? I     
+  believe so because self.data can be changed                                   
+
+  Read 1 file (ctrl+o to expand)
+
+⏺ Yes, keep the lock in size(). Your reasoning is close, but the real reason is
+  a bit more specific.
+
+  Why it's not strictly about safety. In CPython, len(dict) is a single atomic
+  read. That's true with the GIL, and it's also true in the free-threaded builds
+  (I see cpython-315 in your __pycache__), where dicts have their own internal
+  locking. An unlocked size() won't crash or read garbage.
+
+  Why you still want it: invariants. Look at add():
+
+  self.data[key] = node          # dict now has capacity + 1 entries
+  self._move_node_to_front(node)
+  if self.size() > self.capacity:
+      ...
+      del self.data[to_remove.key]  # back to capacity
+
+  There's a window between the insert and the eviction where len(self.data) == 
+  capacity + 1. Without the lock, another thread calling size() could see a
+  value greater than capacity, which should never be possible from the outside.
+  With the lock, size() can only run before or after a whole add(), so it always
+  sees a consistent state. That's a good point to make in an interview: the
+  lock protects your class's invariants, not just the dict.
+
+  Other notes:
+
+  1. RLock is required as written. add() calls self.size() while it already
+     holds the lock. With a plain Lock, that second acquire would deadlock. An
+     RLock works, but a common cleaner pattern is: public methods take the lock,
+     and internal code uses len(self.data) directly. Then a plain Lock is
+     enough and a bit cheaper.
+  2. debug() doesn't take the lock. It reads self.data, self.head and self.tail
+     one after another, so it could print a half-updated linked list. Wrap the
+     body in with self.lock: (fine with RLock, since it calls size()).
+  3. size() is stale as soon as it returns. Even with the lock, the value can
+     change before the caller uses it. So code like if cache.size() < cap: 
+     cache.add(...) is still a race. Any check-then-act has to happen inside a
+     single locked method.
+  4. get() is also a write, since it moves the node to the front. That's why one
+     exclusive lock is the right first pass, and a reader-writer lock wouldn't
+     help much here. Worth saying out loud if you're asked about the trade-off.
+
+❯ Given get is also a write, how can I make the locking more granular? Usually  
+  that's read/write lock where we allow unlimited reads and only block on       
+  writes                                                                        
+
+⏺ You're right that a plain read/write lock doesn't help here, because every
+  get() needs the exclusive lock to move its node. The usual fixes all separate 
+  the lookup from the recency update, so that reads stop mutating the shared
+  linked list on every call. There are four standard approaches, from simplest
+  to most involved.
+
+  1. Sharding (lock striping)
+
+  Split the cache into N independent LRU caches, each with its own lock, and
+  route each key by hash(key) % N.
+
+  class ShardedLRUCache[T]:
+      def __init__(self, capacity: int, num_shards: int = 16):
+          per_shard = max(1, capacity // num_shards)
+          self.shards = [LRUCache[T](per_shard) for _ in range(num_shards)]
+
+      def _shard(self, key: str) -> LRUCache[T]:
+          return self.shards[hash(key) % len(self.shards)]
+
+      def get(self, key):  return self._shard(key).get(key)
+      def add(self, key, value):  self._shard(key).add(key, value)
+
+  - Pro: You reuse your existing class unchanged, and contention drops by
+    roughly a factor of N.
+  - Con: Eviction is only LRU within a shard, not across the whole cache. A
+    shard can evict a key that's newer than the oldest key in another shard. In
+    most real systems that's an acceptable approximation, and it's what
+    memcached-style caches do.
+
+  2. Approximate LRU, so reads don't touch the list (CLOCK / second-chance)
+
+  Drop the linked list. Each entry has a referenced bit. get() only reads the
+  dict and sets the bit, a single write to that entry that never changes the
+  structure. On eviction, a "clock hand" sweeps the entries: if the bit is set,
+  it clears it and moves on; if not, it evicts that entry.
+
+  def get(self, key):
+      entry = self.data.get(key)      # read lock only (or none)
+      if entry is None:
+          return None
+      entry.referenced = True         # benign race: worst case, a lost "touch"
+      return entry.value
+
+  - Pro: Reads can share a read lock, or skip locking entirely. Only add() and
+    eviction need the exclusive lock. This is close to what OS page caches do.
+  - Con: It's no longer exact LRU.
+
+  3. Buffer the recency updates (Caffeine's approach)
+
+  Keep exact LRU, but don't reorder the list inside get(). Instead:
+  - get() looks up the value and appends the node to a thread-safe access
+    buffer, such as a queue.SimpleQueue or a per-thread buffer.
+  - Whenever someone holds the write lock (in add(), or when the buffer passes a
+    threshold), it drains the buffer and replays those moves in one batch.
+  - Use lock.acquire(blocking=False) when draining. If another thread already
+    holds the lock, skip the drain instead of waiting; a later call will do it.
+  - Pro: Reads never block on each other, and you keep (eventual) exact LRU
+    ordering.
+  - Con: It's more complex. Recency lags slightly behind, and if the buffer
+    fills you either drop some accesses or block.
+
+  4. Cheap middle ground: "try to promote"
+
+  Look up the value with no lock or a shared lock, then call
+  lock.acquire(blocking=False) to move the node to the front. If the lock is
+  busy, skip the move.
+
+  - Pro: You change about five lines.
+  - Con: Under contention, hot keys might not get promoted every time. That's
+    usually harmless, because a hot key will get promoted on a later hit.
+
+  Python-specific caveats
+
+  - There's no built-in RWLock. The threading module doesn't have one, so you'd
+    have to build it from Condition (and handle writer starvation) or use a
+    library. That's another reason approaches 1–3 are usually better than a
+    hand-rolled RWLock.
+  - Locking overhead may matter more than contention. With the GIL, Python lock
+    contention is rarely your bottleneck; the overhead of acquiring locks is.
+    Granularity starts to matter in the free-threaded 3.13t+ builds, which you
+    seem to be running.
+
+  What to say in an interview
+
+  Start with the single lock (correct and simple). Point out that get() is a
+  write, so a RW lock doesn't help. Then offer sharding as the practical next
+  step, and CLOCK or buffered updates if they push for lock-free reads. Name the
+  trade-off each time: exact global LRU ordering versus concurrency.
+
+❯ For 3, the draining means moving the node in this buffer to the front?        
+
+⏺ Yes. Draining means taking each node from the buffer, in the order the
+  accesses happened, and calling _move_node_to_front on it under the write lock.
+  Each get() just records "I touched this node", and the drain replays those
+  touches later in one batch.
+
+  import queue
+  import threading
+
+  class BufferedLRUCache[T]:
+      DRAIN_THRESHOLD = 64
+
+      def __init__(self, capacity: int):
+          self.lock = threading.Lock()
+          self.capacity = capacity
+          self.data: dict[str, Node[T]] = {}
+          self.access_buffer: queue.SimpleQueue[Node[T]] = queue.SimpleQueue()
+          # ... head/tail sentinels as before ...
+
+      def get(self, key: str) -> T | None:
+          node = self.data.get(key)          # no lock: dict read is atomic
+          if node is None:
+              return None
+          self.access_buffer.put(node)       # record the touch, don't reorder
+          if self.access_buffer.qsize() >= self.DRAIN_THRESHOLD:
+              self._try_drain()
+          return node.value
+
+      def _try_drain(self) -> None:
+          if not self.lock.acquire(blocking=False):
+              return                         # someone else holds it; they'll 
+  drain
+          try:
+              self._drain()
+          finally:
+              self.lock.release()
+
+      def _drain(self) -> None:              # caller must hold self.lock
+          while True:
+              try:
+                  node = self.access_buffer.get_nowait()
+              except queue.Empty:
+                  return
+              if self.data.get(node.key) is node:   # skip evicted/replaced 
+  nodes
+                  self._move_node_to_front(node)
+
+      def add(self, key: str, value: T) -> None:
+          with self.lock:
+              self._drain()                  # bring recency up to date before 
+  evicting
+              # ... same insert / move-to-front / evict logic as before ...
+
+  Three details matter here:
+
+  1. Replay in FIFO order. If the buffer holds [A, B, A], replaying them in
+     order leaves A at the front, then B, which matches what real LRU would
+     show. Duplicates are fine; they just cost an extra move.
+  2. Check that the node is still live. Between a get() and the drain, the node
+     might have been evicted, or replaced by an add() that made a new node for
+     the same key. Moving an evicted node would re-link it into the list without
+     it being in self.data, which corrupts the cache. The
+     self.data.get(node.key) is node check guards against that.
+  3. Drain before evicting in add(). Otherwise eviction works from stale recency
+     data and might evict something that was just read. You already hold the
+     lock in add(), so that's the natural place to drain.
+
+  In this sketch, get() takes no lock at all, because dict.get and
+  SimpleQueue.put are each thread-safe. Only list mutations happen under the
+  lock, and they're always done by whichever thread holds it. Caffeine goes
+  further: it uses a fixed-size lossy ring buffer and accepts dropping some
+  touches when the buffer is full. That keeps get() from ever growing memory
+  without limit or blocking.
+
+❯ <ide_opened_file>The user opened the file                                     
+  /Users/rebeccawong/Development/2026-interview-practice/practice-coding/src/pr 
+  actice_coding/versioned_key_value_store.py in the IDE. This may or may not be 
+  related to the current task.</ide_opened_file>                                
+
+❯ For the reference bit implementation, do you set the bit when you add? I      
+  think so. And on eviction, it will get set to False. If no one touched it on  
+  next eviction, it would be removed                                            
+
+⏺ Yes, your understanding is right, with two refinements.
+
+  1. Setting the bit on add() is a choice, and both options are used.
+  - Set it to True on insert (classic CLOCK). An insert counts as an access, so
+    a new entry survives one pass of the hand before it can be evicted. This
+    behaves most like LRU.
+  - Set it to False on insert. A new entry has to be read at least once before
+    the hand reaches it, or it gets evicted. This resists scans: a burst of
+    one-time keys (for example, a batch job reading everything once) can't push
+    out your hot entries. Some production caches do this, and it's the idea
+    behind newer algorithms like SIEVE and S3-FIFO.
+
+  Starting with True is the safe default to state. Mentioning the False variant
+  shows you've thought about scan pollution.
+
+  2. The hand clears bits as it sweeps, not only at the moment of eviction.
+  When add() needs to evict, the hand moves forward, checking one entry at a
+  time:
+
+  def _evict(self) -> None:          # caller holds the lock
+      while True:
+          entry = self.slots[self.hand]
+          if entry.referenced:
+              entry.referenced = False   # second chance
+              self.hand = (self.hand + 1) % len(self.slots)
+          else:
+              del self.data[entry.key]   # victim found
+              return                     # new entry goes into this slot
+
+  So the bit gets cleared on every entry the hand passes while it searches for a
+  victim, not just the one it evicts. Then, as you said: if nobody calls get()
+  on that entry before the hand comes back around, its bit is still False and
+  it's evicted.
+
+  Two details:
+  - Where new entries go. Put the new entry into the evicted slot and advance
+    the hand past it. That gives the new entry a full trip of the hand before
+    it's checked again, regardless of how its bit was initialized.
+  - Worst case. If every bit is True, the hand goes all the way around clearing
+    them, then evicts the entry it started at. That single add() costs O(n), and
+    the cache behaves like FIFO for that eviction. The amortized cost is still
+    O(1), because each get() sets at most one bit for the hand to clear later.
+
+❯ What is self.slots and self.hand?                                             
+
+⏺ They hold the "clock" in CLOCK. They replace the linked list from your LRU
+  version:
+
+  - self.slots is a fixed-size list of length capacity that you treat as a
+    circle. Each slot holds one cache entry (or None while the cache is still
+    filling up). Arrange the slots in a ring and you get the clock face.
+  - self.hand is an integer index into self.slots, the clock's hand. It points
+    at the next entry to consider for eviction and advances with (hand + 1) % 
+    capacity, so it wraps around.
+
+  self.data is still the dict from key to entry, used for O(1) lookup. Each
+  entry also stores its slot index, so you can find its position from the key.
+
+  Here's a minimal full version:
+
+  class Entry[T]:
+      def __init__(self, key: str, value: T, slot: int):
+          self.key = key
+          self.value = value
+          self.slot = slot
+          self.referenced = True        # or False for the scan-resistant 
+  variant
+
+
+  class ClockCache[T]:
+      def __init__(self, capacity: int):
+          self.lock = threading.Lock()
+          self.capacity = capacity
+          self.data: dict[str, Entry[T]] = {}
+          self.slots: list[Entry[T] | None] = [None] * capacity
+          self.hand = 0
+
+      def get(self, key: str) -> T | None:
+          entry = self.data.get(key)    # no lock needed for reads
+          if entry is None:
+              return None
+          entry.referenced = True
+          return entry.value
+
+      def add(self, key: str, value: T) -> None:
+          with self.lock:
+              entry = self.data.get(key)
+              if entry is not None:     # update in place, counts as an access
+                  entry.value = value
+                  entry.referenced = True
+                  return
+
+              if len(self.data) < self.capacity:
+                  slot = len(self.data)         # still filling: next empty slot
+              else:
+                  slot = self._evict()          # full: hand finds a victim
+
+              entry = Entry(key, value, slot)
+              self.slots[slot] = entry
+              self.data[key] = entry
+
+      def _evict(self) -> int:          # caller holds the lock
+          while True:
+              entry = self.slots[self.hand]
+              slot = self.hand
+              self.hand = (self.hand + 1) % self.capacity
+              if entry.referenced:
+                  entry.referenced = False      # second chance
+              else:
+                  del self.data[entry.key]
+                  return slot                   # new entry reuses this slot
+
+  Compared with your linked-list LRU:
+
+  ┌──────────────┬──────────────────────────┬───────────────────────────────┐
+  │              │     Linked-list LRU      │             CLOCK             │
+  ├──────────────┼──────────────────────────┼───────────────────────────────┤
+  │ Recency      │ doubly linked list,      │                               │
+  │ structure    │ reordered on every       │ fixed array, never reordered  │
+  │              │ access                   │                               │
+  ├──────────────┼──────────────────────────┼───────────────────────────────┤
+  │ get()        │ moves a node, so it      │ sets one bit, so no           │
+  │              │ needs the exclusive lock │ structural change             │
+  ├──────────────┼──────────────────────────┼───────────────────────────────┤
+  │ Eviction     │ remove tail.prev, O(1)   │ hand sweeps until it finds a  │
+  │              │                          │ cleared bit, amortized O(1)   │
+  ├──────────────┼──────────────────────────┼───────────────────────────────┤
+  │ Ordering     │ exact LRU                │ approximate LRU               │
+  └──────────────┴──────────────────────────┴───────────────────────────────┘
+
+  Because the hand advances before _evict returns, the new entry sits just
+  behind the hand. That gives it the full trip around the clock I mentioned
+  earlier.
+
+  One simplification to note: this version filling slots with slot = 
+  len(self.data) only works because nothing is ever deleted except through
+  eviction. If you add a delete(key) method, you'd need to track free slots, for
+  example with a list of free indices, since deleting would leave holes in the
+  array.
+
+❯ <ide_opened_file>The user opened the file /Users/rebeccawong/Development/2026 
+  -interview-practice/practice-coding/src/practice_coding/lru_cache.py in the   
+  IDE. This may or may not be related to the current task.</ide_opened_file>    
+
+❯ can you add unit test to test multi-threaded behavior?                        
+
+  Searched for 1 pattern, ran 2 shell commands (ctrl+o to expand)
+
+⏺ I'll add pytest as a dev dependency, matching your other projects, and write
+  stress tests that check the cache's invariants after many threads hammer it.
+
+⏺ Bash(uv add --dev pytest 2>&1 | tail -3; mkdir -p tests)
+  ⎿   ~ practice-coding==0.1.0 (from file:///Users/rebeccawong/Development/
+     2026-interview-practice/practice-coding)
+      + pygments==2.21.0
+      + pytest==9.2.0
+  ⎿  Updated practice-coding/pyproject.toml (+5 -0)
+      15  [build-system]
+      16  requires = ["uv_build>=0.13.1,<0.14.0"]
+      17  build-backend = "uv_build"
+      18 +                                                               
+      19 +[dependency-groups]                                            
+      20 +dev = [                                                        
+      21 +    "pytest>=9.2.0",                                           
+      22 +]                                                              
+  ⎿  Updated practice-coding/uv.lock (+71 -0)
+       2  revision = 5
+       3  requires-python = ">=3.14"
+       4  
+       5 +[[package]]                                                    
+       6 +name = "colorama"                                              
+       7 +version = "0.4.6"                                              
+       8 +source = { registry = "https://pypi.org/simple" }              
+       9 +sdist = { url = "https://files.pythonhosted.org/packages/d8/53/
+         +6f443c9a4a8358a93a6792e2acffb9d9d5cb0a5cfd8802644b7b1c9a02e4/co
+         +lorama-0.4.6.tar.gz", hash = "sha256:08695f5cb7ed6e0531a2057269
+         +7297273c47b8cae5a63ffc6d6ed5c201be6e44", size = 27697, upload-t
+         +ime = "2022-10-25T02:36:22.414Z" }                             
+      10 +wheels = [                                                     
+      11 +    { url = "https://files.pythonhosted.org/packages/d1/d6/3965
+         +ed04c63042e047cb6a3e6ed1a63a35087b6a609aa3a15ed8ac56c221/colora
+         +ma-0.4.6-py2.py3-none-any.whl", hash = "sha256:4f1d9991f5acc0ca
+         +119f9d443620b77f9d6b33703e51011c16baf57afb285fc6", size = 25335
+         +, upload-time = "2022-10-25T02:36:20.889Z" },                  
+      12 +]                                                              
+      13 +                                                               
+      14 +[[package]]                                                    
+      15 +name = "iniconfig"                                             
+      16 +version = "2.3.1"                                              
+      17 +source = { registry = "https://pypi.org/simple" }              
+      18 +sdist = { url = "https://files.pythonhosted.org/packages/01/e1/
+         +2069291243c926a2ff1cd706c7f3eeb9b62144bf60f77c9fb9ff2fb26bd3/in
+         +iconfig-2.3.1.tar.gz", hash = "sha256:67f4b9c50da0dedf52af349e7
+         +749a80a9057a5031199791b906c3bb3ae878960", size = 21209, upload-
+         +time = "2026-10-06T22:48:38.076Z" }                            
+      19 +wheels = [                                                     
+      20 +    { url = "https://files.pythonhosted.org/packages/56/43/4ca9
+         +e49d27a1fcf6bece6f6aec0ea46bb9112489b93d4b688fb415457bdb/inicon
+         +fig-2.3.1-py3-none-any.whl", hash = "sha256:9121e2c1fdb35523249
+         +5be3194c8dfe87ccc2d5dee45947b78e68f499790d7a7", size = 7552, up
+         +load-time = "2026-10-06T22:48:36.959Z" },                      
+      21 +]                                                              
+      22 +                                                               
+      23 +[[package]]                                                    
+      24 +name = "packaging"                                             
+      25 +version = "26.3"                                               
+      26 +source = { registry = "https://pypi.org/simple" }              
+      27 +sdist = { url = "https://files.pythonhosted.org/packages/7d/fa/
+         +3944b40b07da9ce895c0e6303a5ab7d53da063554f534556b134a54d6093/pa
+         +ckaging-26.3.tar.gz", hash = "sha256:94edc256424af38762eb31306e
+         +ed28beb9f0efc50a8837492c9d6fd6004aed79", size = 313412, upload-
+         +time = "2026-08-04T18:15:28.737Z" }                            
+      28 +wheels = [                                                     
+      29 +    { url = "https://files.pythonhosted.org/packages/63/34/ba1c
+         +580383c9eada3711951fef0795c80b829a078d72188184bcab9dd527/packag
+         +ing-26.3-py3-none-any.whl", hash = "sha256:d7193f7c8e4e93f444fd
+         +e0262bf90af30e16fa0ad0ad44cb553c87339b23cd1c", size = 129956, u
+         +pload-time = "2026-08-04T18:15:27.159Z" },                     
+      30 +]                                                              
+      31 +                                                               
+      32 +[[package]]                                                    
+      33 +name = "pluggy"                                                
+      34 +version = "1.7.0"                                              
+      35 +source = { registry = "https://pypi.org/simple" }              
+      36 +sdist = { url = "https://files.pythonhosted.org/packages/bf/db/
+         +7fc19e6f2dc92a966727031389fc2e08b558f0f25eb7403c1119ad4713cd/pl
+         +uggy-1.7.0.tar.gz", hash = "sha256:d1eaa46ebb595891b860ab086b4d
+         +09c8588af65ebd4361b8e8f4bb8920b90ba8", size = 123304, upload-ti
+         +me = "2026-10-15T09:50:58.343Z" }                              
+      37 +wheels = [                                                     
+      38 +    { url = "https://files.pythonhosted.org/packages/40/9e/2b38
+         +731e0fc536806f16490e1a12d7f0dc2a1235aa8cc07bcc75416a7daa/pluggy
+         +-1.7.0-py3-none-any.whl", hash = "sha256:7dd7b0d8832ba3cb632c30
+         +6926ded123429211b83641b35dc5c41ad2d34f9bec", size = 27082, uplo
+         +ad-time = "2026-10-15T09:50:56.808Z" },                        
+      39 +]                                                              
+      40 +                                                               
+      41  [[package]]
+     … 38 more lines (ctrl+o to expand)
+
+⏺ Write(practice-coding/tests/test_lru_cache.py)
+  ⎿  Wrote 163 lines to practice-coding/tests/test_lru_cache.py
+       1 import random
+       2 import sys
+       3 import threading
+       4 from collections.abc import Callable, Iterator
+       5 
+       6 import pytest
+       7 
+       8 from practice_coding.lru_cache import LRUCache
+       9 
+      10 NUM_THREADS = 8
+     … +153 lines (ctrl+o to expand)
+
+⏺ Bash(uv run pytest tests/test_lru_cache.py -q 2>&1 | tail -15)
+  ⎿  .....
+        [100%]
+     5 passed in 0.75s
+  ⎿  2 files changed (binary, mode only or too large to show)
+
+⏺ All 5 pass. Next I'll check that the tests can actually catch a bug, by
+  running them against a version where the lock does nothing:
+
+  Ran 1 shell command (ctrl+o to expand)
+
+⏺ Without the lock, 4 of the 5 tests fail on every run. Last, I'll run the real
+  suite several times to make sure it isn't flaky:
+
+  Ran 1 shell command (ctrl+o to expand)
+
+⏺ I added 5 multi-threaded tests in tests/test_lru_cache.py
+  (practice-coding/tests/test_lru_cache.py), plus pytest as a dev dependency.
+  They pass with your lock (10 out of 10 runs, about 0.8s each). To check they
+  actually catch races, I also ran them with the lock replaced by one that does
+  nothing: 4 of the 5 failed on every run.
+
+  How the tests work:
+  - Each test starts 8 threads at the same moment and has each one do 5,000
+    operations.
+  - Any exception in a thread fails the test. A thread that hasn't finished
+    after 30s also fails it, which catches deadlocks.
+  - I set Python's thread switch interval to 1µs during the tests, so threads
+    interleave far more often than usual. Without that, races hide on your GIL
+    build.
+
+  What they check:
+
+  Test: test_concurrent_adds_of_distinct_keys_respect_capacity
+  Catches: evictions lost when two adds overlap
+  ────────────────────────────────────────
+  Test: test_concurrent_mixed_get_and_add_keeps_structure_consistent
+  Catches: a broken linked list from get() and add() moving nodes at once
+  ────────────────────────────────────────
+  Test: test_size_never_observed_above_capacity
+  Catches: size() returning capacity + 1 mid-add() (the race from your first
+    question)
+  ────────────────────────────────────────
+  Test: test_concurrent_writes_to_same_key_last_write_is_one_of_the_writers
+  Catches: duplicate entries for one key
+  ────────────────────────────────────────
+  Test: test_get_returns_only_values_that_were_written_for_that_key
+  Catches: get() returning another key's value
+
+  After each run, a helper (assert_consistent) walks the list in both directions
+  and checks that its nodes are exactly the ones in self.data, with no more
+  than capacity entries.
+
+  Things to know:
+  - These are stress tests. Passing makes a race unlikely, but can't prove there
+    isn't one.
+  - The same-key test still passed without the lock. Racing writes to a single
+    key don't break anything visibly, so it's a weak check of thread safety,
+    mostly a sanity check.
+  - lru_cache.py still runs its demo code (cache = LRUCache(1) and the debug()
+    calls) at the bottom of the file. That runs on import, so the tests print
+    it. Putting it under if __name__ == "__main__": would stop that.
+
+  To run them: cd practice-coding && uv run pytest tests/test_lru_cache.py
+
+❯ <ide_opened_file>The user opened the file /Users/rebeccawong/Development/2026 
+  -interview-practice/practice-coding/tests/test_lru_cache.py in the IDE. This  
+  may or may not be related to the current task.</ide_opened_file>              
+
+❯ assert_consistent is accessing the cache's internal state. that seems wrong.  
+
+⏺ Agreed. assert_consistent reaches into head, tail, data and lock, so the tests
+  are tied to the linked-list implementation. If you swap in CLOCK or the
+  buffered version, they break even though the cache still behaves correctly.
+  I'll replace it with a check that only uses add, get and size.
+
+  The idea: after the concurrent phase, run a known single-threaded sequence
+  through the public API. Corruption from a race will show up there:
+  - An entry that's in the dict but not in the list never gets evicted, so an
+    old key survives or size() goes above capacity.
+  - A node that's in the list but not in the dict raises KeyError when it's
+    evicted.
+  - A broken ordering evicts the wrong key.
+
+⏺ Update(practice-coding/tests/test_lru_cache.py)
+  ⎿  Added 25 lines, removed 21 lines
+      42          raise errors[0]
+      43  
+      44  
+      45 -def assert_consistent(cache: LRUCache) -> None:                
+      46 -    """The linked list and the dict must describe exactly the s
+         -ame set of nodes."""                                           
+      47 -    with cache.lock:                                           
+      48 -        forward = []                                           
+      49 -        node = cache.head.next                                 
+      50 -        while node is not cache.tail:                          
+      51 -            assert node.next.prev is node, f"broken back-pointe
+         -r at {node.key}"                                               
+      52 -            forward.append(node)                               
+      53 -            node = node.next                                   
+      54 -            assert len(forward) <= cache.capacity, "list longer
+         - than capacity (cycle?)"                                       
+      45 +def assert_still_behaves_like_lru(cache: LRUCache, capacity: in
+         +t, old_keys: list[str]) -> None:                               
+      46 +    """After concurrent use, the cache must still behave correc
+         +tly through its public API.                                    
+      47  
+      56 -        backward = []                                          
+      57 -        node = cache.tail.prev                                 
+      58 -        while node is not cache.head:                          
+      59 -            backward.append(node)                              
+      60 -            node = node.prev                                   
+      61 -            assert len(backward) <= cache.capacity, "list longe
+         -r than capacity (cycle?)"                                      
+      48 +    Corruption from a race shows up here: entries that never ge
+         +t evicted leave old keys                                       
+      49 +    behind or push size() above capacity, dangling nodes raise 
+         +on eviction, and a broken                                      
+      50 +    ordering evicts the wrong key.                             
+      51 +    """                                                        
+      52 +    assert cache.size() <= capacity                            
+      53  
+      63 -        assert forward == backward[::-1]                       
+      64 -        assert len(cache.data) <= cache.capacity               
+      65 -        assert {n.key for n in forward} == set(cache.data)     
+      66 -        for n in forward:                                      
+      67 -            assert cache.data[n.key] is n                      
+      54 +    # Flush: `capacity` fresh keys must evict every entry writt
+         +en during the concurrent phase.                                
+      55 +    fresh = [f"__fresh{i}" for i in range(capacity)]           
+      56 +    for i, key in enumerate(fresh):                            
+      57 +        cache.add(key, i)                                      
+      58 +    assert cache.size() == capacity                            
+      59 +    for key in old_keys:                                       
+      60 +        assert cache.get(key) is None, f"{key} survived a full 
+         +flush"                                                         
+      61 +    for i, key in enumerate(fresh):                            
+      62 +        assert cache.get(key) == i                             
+      63  
+      64 +    # Recency still works: touch the oldest key, then the next-
+         +oldest is evicted instead.                                     
+      65 +    cache.get(fresh[0])                                        
+      66 +    cache.add("__extra", -1)                                   
+      67 +    assert cache.size() == capacity                            
+      68 +    assert cache.get(fresh[0]) == 0                            
+      69 +    if capacity > 1:                                           
+      70 +        assert cache.get(fresh[1]) is None                     
+      71 +    assert cache.get("__extra") == -1                          
+      72  
+      73 +                                                               
+      74  def test_concurrent_adds_of_distinct_keys_respect_capacity() ->
+           None:
+      75      capacity = 50
+      76      cache: LRUCache[int] = LRUCache(capacity)
+
+⏺ Next I'll update the four call sites. Each one passes the keys it wrote during
+  the concurrent phase.
+
+⏺ Update(practice-coding/tests/test_lru_cache.py)
+  ⎿  Added 2 lines, removed 1 line
+      82      run_concurrently(worker)
+      83  
+      84      assert cache.size() == capacity
+      85 -    assert_consistent(cache)                                   
+      85 +    written = [f"t{t}-k{i}" for t in range(NUM_THREADS) for i i
+         +n range(OPS_PER_THREAD)]                                       
+      86 +    assert_still_behaves_like_lru(cache, capacity, written)    
+      87  
+      88  
+      89  def test_concurrent_mixed_get_and_add_keeps_structure_consisten
+          t() -> None:
+
+⏺ Update(practice-coding/tests/test_lru_cache.py)
+  ⎿  Added 1 line, removed 1 line
+      102  
+      103      run_concurrently(worker)
+      104  
+      105 -    assert_consistent(cache)                                  
+      105 +    assert_still_behaves_like_lru(cache, capacity, keys)      
+      106  
+      107  
+      108  def test_size_never_observed_above_capacity() -> None:
+⏺ Update(practice-coding/tests/test_lru_cache.py)
+  ⎿  Added 2 lines, removed 1 line
+      133  
+      134  
+      135  def test_concurrent_writes_to_same_key_last_write_is_one_of_th
+           e_writers() -> None:
+      136 -    cache: LRUCache[tuple[int, int]] = LRUCache(5)            
+      136 +    capacity = 5                                              
+      137 +    cache: LRUCache[tuple[int, int]] = LRUCache(capacity)     
+      138  
+      139      def worker(thread_id: int) -> None:
+      140          for i in range(OPS_PER_THREAD):
+
+⏺ Update(practice-coding/tests/test_lru_cache.py)
+  ⎿  Added 1 line, removed 1 line
+      146      thread_id, i = cache.get("shared")
+      147      assert 0 <= thread_id < NUM_THREADS
+      148      assert i == OPS_PER_THREAD - 1  # each thread's final writ
+           e is its last i
+      149 -    assert_consistent(cache)                                  
+      149 +    assert_still_behaves_like_lru(cache, capacity, ["shared"])
+      150  
+      151  
+      152  def test_get_returns_only_values_that_were_written_for_that_ke
+           y() -> None:
+
+⏺ Update(practice-coding/tests/test_lru_cache.py)
+  ⎿  Added 2 lines, removed 1 line
+      151  
+      152  def test_get_returns_only_values_that_were_written_for_that_ke
+           y() -> None:
+      153      """Readers must never see a value belonging to a different
+            key (torn update)."""
+      154 -    cache: LRUCache[str] = LRUCache(8)                        
+      154 +    capacity = 8                                              
+      155 +    cache: LRUCache[str] = LRUCache(capacity)                 
+      156      keys = [f"k{i}" for i in range(16)]
+      157  
+      158      def worker(thread_id: int) -> None:
+
+⏺ Update(practice-coding/tests/test_lru_cache.py)
+  ⎿  Added 1 line, removed 1 line
+      167  
+      168      run_concurrently(worker)
+      169  
+      170 -    assert_consistent(cache)                                  
+      170 +    assert_still_behaves_like_lru(cache, capacity, keys)      
+
+⏺ Bash(grep -n "cache\.\(lock\|data\|head\|tail\|capacity\)"
+      tests/test_lru_cache.py; for i in $(seq 1 5); do uv run pytest
+      tests/test_lru_cache.py -q -p no:cacheprovi…)
+  ⎿  5 passed in 0.80s
+     5 passed in 0.80s
+     5 passed in 0.80s
+     … +6 lines (ctrl+o to expand)
+  ⎿  1 file changed (binary, mode only or too large to show)
+
+⏺ I rewrote the check so the tests only use the cache's public API: add, get and
+  size. They no longer touch lock, data, head, tail or capacity.
+
+  What changed: assert_consistent became assert_still_behaves_like_lru(cache, 
+  capacity, old_keys) in tests/test_lru_cache.py
+  (practice-coding/tests/test_lru_cache.py). Each test passes in its capacity
+  and the keys it wrote. Instead of walking the linked list, the check runs a
+  known sequence through the API after the threads finish:
+  1. size() is at most capacity.
+  2. Adding capacity new keys must evict every key from the threaded phase. Then
+     size() == capacity, every old key's get returns None, and every new key
+     returns its value.
+  3. Recency still works: read the oldest key, add one more, and the
+     second-oldest is the one evicted.
+
+  Results: All 5 pass, 5 out of 5 runs. With the lock disabled, 4 of the 5 still
+  fail every time, so the public-API check catches races as well as the
+  internal one did.
+
+  Trade-off: A broken pointer that never affects behavior would now go
+  unnoticed. That's arguably fine, since only corruption that changes behavior
+  matters to callers. In return, the tests should work unchanged against a
+  sharded or buffered cache. CLOCK would need tweaks, since the recency check
+  and the exact eviction counts assume strict LRU. If you ever want the
+  structural checks back, the usual approach is to put them in the class as a
+  _check_invariants() method, so the class checks its own internals instead of
+  the test reaching in.
+
+❯ <ide_opened_file>The user opened the file /Users/rebeccawong/Development/2026 
+  -interview-practice/practice-coding/tests/test_lru_cache.py in the IDE. This  
+  may or may not be related to the current task.</ide_opened_file>              
+
+❯ This can't find lru_cache module when I run it                                
+
+  Ran 1 shell command (ctrl+o to expand)
+
+⏺ The uv run command works from both locations, so the likely cause is a
+  different Python interpreter in the IDE, since your __pycache__ shows
+  cpython-315 while the project's .venv uses 3.14. I'm going to reproduce the
+  failure using that interpreter. · summary
+
+⏺ Bash(cd /Users/rebeccawong/Development/2026-interview-practice; ls -d */.venv;
+      echo "--- python-cli venv (has pytest, not practice_coding) ---";
+      python-cli/.venv/bin…)
+  ⎿  fastapi-pydantic/.venv
+     payments-agent/.venv
+     practice-coding/.venv
+     … +5 lines (ctrl+o to expand)
+  ⎿  1 file changed (binary, mode only or too large to show)
+
+⏺ That reproduces it. Next I'll tell pytest to add src to the import path, so
+  the tests don't depend on the package being installed in whatever interpreter
+  runs them:
+
+⏺ Bash(cd /Users/rebeccawong/Development/2026-interview-practice/practice-coding
+      && cat >> pyproject.toml <<'EOF'…)
+  ⎿  --- other venv, from repo root ---
+     5 passed in 0.78s
+     --- other venv, rootdir forced to repo root (like VS Code) ---
+     … +3 lines (ctrl+o to expand)
+  ⎿  Updated practice-coding/pyproject.toml (+4 -0)
+      20  dev = [
+      21      "pytest>=9.2.0",
+      22  ]
+      23 +                                                               
+      24 +[tool.pytest.ini_options]                                      
+      25 +pythonpath = ["src"]                                           
+      26 +testpaths = ["tests"]                                          
+
+⏺ It should work now. The tests were being run by a Python that didn't have
+  practice_coding installed. I reproduced the same ModuleNotFoundError by
+  running them with the python-cli project's .venv, which has pytest but not
+  your package. Your __pycache__ files are from Python 3.15, while the
+  practice-coding venv is 3.14, so your editor is probably using a different
+  interpreter.
+
+  I added this to practice-coding/pyproject.toml:
+
+  [tool.pytest.ini_options]
+  pythonpath = ["src"]
+  testpaths = ["tests"]
+
+  pythonpath makes pytest add src/ to the import path itself, so practice_coding
+  is found whether or not it's installed. All 5 tests now pass with uv run 
+  pytest and when run from the repo root with the other project's venv.
+
+  If it still fails, check two things in VS Code:
+  - Interpreter: run "Python: Select Interpreter" from the command palette and
+    pick practice-coding/.venv/bin/python. An interpreter without pytest fails
+    with "No module named pytest" before it gets to your module.
+  - How you run it: use the Testing sidebar or the run icons next to each test,
+    not "Run Python File". Running the file directly only defines the test
+    functions and never calls them.
+
+  If you still see an error, send me the exact message and how you ran it.
+
+❯ <ide_opened_file>The user opened the file /Users/rebeccawong/Development/2026 
+  -interview-practice/practice-coding/tests/test_lru_cache.py in the IDE. This  
+  may or may not be related to the current task.</ide_opened_file>              
+
+❯ i don't see a run icon next to each test                                      
+
+  Listed 1 directory (ctrl+o to expand)
+
+⏺ VS Code can't find any tests because pytest isn't enabled for this workspace
+  and the default interpreter lacks it. I'm adding workspace settings to enable
+  pytest and point it at the practice-coding venv. · summary
+
+⏺ Write(.vscode/settings.json)
+  ⎿  Wrote 7 lines to .vscode/settings.json
+      1 {
+      2     "python.defaultInterpreterPath": "${workspaceFolder}/practice
+        -coding/.venv/bin/python",
+      3     "python.testing.pytestEnabled": true,
+      4     "python.testing.unittestEnabled": false,
+      5     "python.testing.cwd": "${workspaceFolder}/practice-coding",
+      6     "python.testing.pytestArgs": ["tests"]
+      7 }
+
+  Ran 1 shell command (ctrl+o to expand)
+
+⏺ I added .vscode/settings.json, which turns on pytest for this workspace and
+  points it at the practice-coding venv. That's the interpreter that has pytest
+  installed; your global default, /usr/bin/python3, doesn't. In a terminal, that
+  same interpreter finds all 5 tests in that folder. I couldn't check the run
+  icons themselves, so you'll need to look in VS Code.
+
+  To make the icons appear:
+  1. Run "Python: Select Interpreter" from the command palette (Cmd+Shift+P) and
+     pick practice-coding/.venv/bin/python. The new setting is only a default,
+     so an interpreter you selected earlier still overrides it.
+  2. Open the Testing sidebar (the flask icon) and click Refresh Tests. If
+     nothing shows up, run "Developer: Reload Window".
+
+  The icons should then show in the editor gutter next to each def test_..., and
+  the tests should be listed in the Testing sidebar.
+
+  These settings only cover practice-coding. Your other projects have their own
+  venvs and tests, so you'd need to change python.testing.cwd and the
+  interpreter to work on one of them in this window. If you go back and forth a
+  lot, you could open each project as its own folder in VS Code, or set up a
+  multi-root workspace.
+
+❯ can we just use unittest to keep things simple? i don't want to be installing 
+  dependencies during interview                                                 
+
+⏺ Sure. unittest comes with Python, so there's nothing to install. I'll convert
+  the tests, remove pytest from the project, and switch VS Code to unittest.
+
+⏺ Write(practice-coding/tests/test_lru_cache.py)
+  ⎿  Added 110 lines, removed 107 lines
+       1  import random
+       2  import sys
+       3  import threading
+       4 -from collections.abc import Callable, Iterator                 
+       4 +import unittest                                                
+       5 +from collections.abc import Callable                           
+       6  
+       6 -import pytest                                                  
+       7 -                                                               
+       7  from practice_coding.lru_cache import LRUCache
+       8  
+       9  NUM_THREADS = 8
+      10  OPS_PER_THREAD = 5_000
+      11  
+      12  
+      14 -@pytest.fixture(autouse=True)                                  
+      15 -def frequent_thread_switches() -> Iterator[None]:              
+      13 +def setUpModule() -> None:                                     
+      14      """Force the interpreter to switch threads very often so ra
+          ces surface."""
+      17 -    original = sys.getswitchinterval()                         
+      15 +    global _original_switch_interval                           
+      16 +    _original_switch_interval = sys.getswitchinterval()        
+      17      sys.setswitchinterval(1e-6)
+      19 -    yield                                                      
+      20 -    sys.setswitchinterval(original)                            
+      18  
+      19  
+      20 +def tearDownModule() -> None:                                  
+      21 +    sys.setswitchinterval(_original_switch_interval)           
+      22 +                                                               
+      23 +                                                               
+      24  def run_concurrently(worker: Callable[[int], None], num_threads
+          : int = NUM_THREADS) -> None:
+      25      """Start all workers at the same instant and re-raise any e
+          xception they hit."""
+      26      barrier = threading.Barrier(num_threads)
+     ...
+      30          barrier.wait()
+      31          try:
+      32              worker(thread_id)
+      32 -        except BaseException as e:  # noqa: BLE001 - surface an
+         -ything to the main thread                                      
+      33 +        except BaseException as e:                             
+      34              errors.append(e)
+      35  
+      36      threads = [threading.Thread(target=wrapped, args=(i,)) for 
+          i in range(num_threads)]
+     ...
+       38          t.start()
+       39      for t in threads:
+       40          t.join(timeout=30)
+       40 -        assert not t.is_alive(), "worker thread hung (possible
+          - deadlock)"                                                   
+       41 +        if t.is_alive():                                      
+       42 +            raise AssertionError("worker thread hung (possible
+          + deadlock)")                                                  
+       43      if errors:
+       44          raise errors[0]
+       45  
+       46  
+       45 -def assert_still_behaves_like_lru(cache: LRUCache, capacity: i
+          -nt, old_keys: list[str]) -> None:                             
+       46 -    """After concurrent use, the cache must still behave corre
+          -ctly through its public API.                                  
+       47 +class LRUCacheThreadSafetyTest(unittest.TestCase):            
+       48 +    def assert_still_behaves_like_lru(self, cache: LRUCache, c
+          +apacity: int, old_keys: list[str]) -> None:                   
+       49 +        """After concurrent use, the cache must still behave c
+          +orrectly through its public API.                              
+       50  
+       48 -    Corruption from a race shows up here: entries that never g
+          -et evicted leave old keys                                     
+       49 -    behind or push size() above capacity, dangling nodes raise
+          - on eviction, and a broken                                    
+       50 -    ordering evicts the wrong key.                            
+       51 -    """                                                       
+       52 -    assert cache.size() <= capacity                           
+       51 +        Corruption from a race shows up here: entries that nev
+          +er get evicted leave old keys                                 
+       52 +        behind or push size() above capacity, dangling nodes r
+          +aise on eviction, and a broken                                
+       53 +        ordering evicts the wrong key.                        
+       54 +        """                                                   
+       55 +        self.assertLessEqual(cache.size(), capacity)          
+       56  
+       54 -    # Flush: `capacity` fresh keys must evict every entry writ
+          -ten during the concurrent phase.                              
+       55 -    fresh = [f"__fresh{i}" for i in range(capacity)]          
+       56 -    for i, key in enumerate(fresh):                           
+       57 -        cache.add(key, i)                                     
+       58 -    assert cache.size() == capacity                           
+       59 -    for key in old_keys:                                      
+       60 -        assert cache.get(key) is None, f"{key} survived a full
+          - flush"                                                       
+       61 -    for i, key in enumerate(fresh):                           
+       62 -        assert cache.get(key) == i                            
+       57 +        # Flush: `capacity` fresh keys must evict every entry 
+          +written during the concurrent phase.                          
+       58 +        fresh = [f"__fresh{i}" for i in range(capacity)]      
+       59 +        for i, key in enumerate(fresh):                       
+       60 +            cache.add(key, i)                                 
+       61 +        self.assertEqual(cache.size(), capacity)              
+       62 +        for key in old_keys:                                  
+       63 +            self.assertIsNone(cache.get(key), f"{key} survived
+          + a full flush")                                               
+       64 +        for i, key in enumerate(fresh):                       
+       65 +            self.assertEqual(cache.get(key), i)               
+       66  
+       64 -    # Recency still works: touch the oldest key, then the next
+          --oldest is evicted instead.                                   
+       65 -    cache.get(fresh[0])                                       
+       66 -    cache.add("__extra", -1)                                  
+       67 -    assert cache.size() == capacity                           
+       68 -    assert cache.get(fresh[0]) == 0                           
+       69 -    if capacity > 1:                                          
+       70 -        assert cache.get(fresh[1]) is None                    
+       71 -    assert cache.get("__extra") == -1                         
+       67 +        # Recency still works: touch the oldest key, then the 
+          +next-oldest is evicted instead.                               
+       68 +        cache.get(fresh[0])                                   
+       69 +        cache.add("__extra", -1)                              
+       70 +        self.assertEqual(cache.size(), capacity)              
+       71 +        self.assertEqual(cache.get(fresh[0]), 0)              
+       72 +        if capacity > 1:                                      
+       73 +            self.assertIsNone(cache.get(fresh[1]))            
+       74 +        self.assertEqual(cache.get("__extra"), -1)            
+       75  
+       76 +    def test_concurrent_adds_of_distinct_keys_respect_capacity
+          +(self) -> None:                                               
+       77 +        capacity = 50                                         
+       78 +        cache: LRUCache[int] = LRUCache(capacity)             
+       79  
+       74 -def test_concurrent_adds_of_distinct_keys_respect_capacity() -
+          -> None:                                                       
+       75 -    capacity = 50                                             
+       76 -    cache: LRUCache[int] = LRUCache(capacity)                 
+       80 +        def worker(thread_id: int) -> None:                   
+       81 +            for i in range(OPS_PER_THREAD):                   
+       82 +                cache.add(f"t{thread_id}-k{i}", i)            
+       83  
+       78 -    def worker(thread_id: int) -> None:                       
+       79 -        for i in range(OPS_PER_THREAD):                       
+       80 -            cache.add(f"t{thread_id}-k{i}", i)                
+       84 +        run_concurrently(worker)                              
+       85  
+       82 -    run_concurrently(worker)                                  
+       86 +        self.assertEqual(cache.size(), capacity)              
+       87 +        written = [f"t{t}-k{i}" for t in range(NUM_THREADS) fo
+          +r i in range(OPS_PER_THREAD)]                                 
+       88 +        self.assert_still_behaves_like_lru(cache, capacity, wr
+          +itten)                                                        
+       89  
+       84 -    assert cache.size() == capacity                           
+       85 -    written = [f"t{t}-k{i}" for t in range(NUM_THREADS) for i 
+          -in range(OPS_PER_THREAD)]                                     
+       86 -    assert_still_behaves_like_lru(cache, capacity, written)   
+       90 +    def test_concurrent_mixed_get_and_add_keeps_structure_cons
+          +istent(self) -> None:                                         
+       91 +        capacity = 20                                         
+       92 +        cache: LRUCache[int] = LRUCache(capacity)             
+       93 +        keys = [f"k{i}" for i in range(100)]  # more keys than
+          + capacity -> constant eviction                                
+       94  
+       95 +        def worker(thread_id: int) -> None:                   
+       96 +            rng = random.Random(thread_id)                    
+       97 +            for _ in range(OPS_PER_THREAD):                   
+       98 +                key = rng.choice(keys)                        
+       99 +                if rng.random() < 0.5:                        
+      100 +                    cache.add(key, rng.randint(0, 1_000))     
+      101 +                else:                                         
+      102 +                    cache.get(key)                            
+      103  
+       89 -def test_concurrent_mixed_get_and_add_keeps_structure_consiste
+          -nt() -> None:                                                 
+       90 -    capacity = 20                                             
+       91 -    cache: LRUCache[int] = LRUCache(capacity)                 
+       92 -    keys = [f"k{i}" for i in range(100)]  # more keys than cap
+          -acity -> constant eviction                                    
+      104 +        run_concurrently(worker)                              
+      105  
+       94 -    def worker(thread_id: int) -> None:                       
+       95 -        rng = random.Random(thread_id)                        
+       96 -        for _ in range(OPS_PER_THREAD):                       
+       97 -            key = rng.choice(keys)                            
+       98 -            if rng.random() < 0.5:                            
+       99 -                cache.add(key, rng.randint(0, 1_000))         
+      100 -            else:                                             
+      101 -                cache.get(key)                                
+      106 +        self.assert_still_behaves_like_lru(cache, capacity, ke
+          +ys)                                                           
+      107  
+      103 -    run_concurrently(worker)                                  
+      108 +    def test_size_never_observed_above_capacity(self) -> None:
+      109 +        """add() briefly holds capacity + 1 entries before evi
+          +cting; readers must never see that."""                        
+      110 +        capacity = 10                                         
+      111 +        cache: LRUCache[int] = LRUCache(capacity)             
+      112 +        stop = threading.Event()                              
+      113 +        observed_max = 0                                      
+      114  
+      105 -    assert_still_behaves_like_lru(cache, capacity, keys)      
+      115 +        def observer() -> None:                               
+      116 +            nonlocal observed_max                             
+      117 +            while not stop.is_set():                          
+      118 +                observed_max = max(observed_max, cache.size())
+      119  
+      107 -                                                              
+      108 -def test_size_never_observed_above_capacity() -> None:        
+      109 -    """add() briefly holds capacity + 1 entries before evictin
+          -g; readers must never see that."""                            
+      110 -    capacity = 10                                             
+      111 -    cache: LRUCache[int] = LRUCache(capacity)                 
+      112 -    stop = threading.Event()                                  
+      113 -    observed_max = 0                                          
+      114 -                                                              
+      115 -    def observer() -> None:                                   
+      116 -        nonlocal observed_max                                 
+      117 -        while not stop.is_set():                              
+      118 -            observed_max = max(observed_max, cache.size())    
+      119 -                                                              
+      120 -    watcher = threading.Thread(target=observer)               
+      121 -    watcher.start()                                           
+      122 -    try:                                                      
+      120          def worker(thread_id: int) -> None:
+      121              for i in range(OPS_PER_THREAD):
+      122                  cache.add(f"t{thread_id}-k{i}", i)
+      123  
+      127 -        run_concurrently(worker)                              
+      128 -    finally:                                                  
+      129 -        stop.set()                                            
+      130 -        watcher.join()                                        
+      124 +        watcher = threading.Thread(target=observer)           
+      125 +        watcher.start()                                       
+      126 +        try:                                                  
+      127 +            run_concurrently(worker)                          
+      128 +        finally:                                              
+      129 +            stop.set()                                        
+      130 +            watcher.join()                                    
+      131  
+      132 -    assert observed_max <= capacity                           
+      132 +        self.assertLessEqual(observed_max, capacity)          
+      133  
+      134 +    def test_concurrent_writes_to_same_key_last_write_is_one_o
+          +f_the_writers(self) -> None:                                  
+      135 +        capacity = 5                                          
+      136 +        cache: LRUCache[tuple[int, int]] = LRUCache(capacity) 
+      137  
+      135 -def test_concurrent_writes_to_same_key_last_write_is_one_of_th
+          -e_writers() -> None:                                          
+      136 -    capacity = 5                                              
+      137 -    cache: LRUCache[tuple[int, int]] = LRUCache(capacity)     
+      138 +        def worker(thread_id: int) -> None:                   
+      139 +            for i in range(OPS_PER_THREAD):                   
+      140 +                cache.add("shared", (thread_id, i))           
+      141  
+      139 -    def worker(thread_id: int) -> None:                       
+      140 -        for i in range(OPS_PER_THREAD):                       
+      141 -            cache.add("shared", (thread_id, i))               
+      142 +        run_concurrently(worker)                              
+      143  
+      143 -    run_concurrently(worker)                                  
+      144 +        self.assertEqual(cache.size(), 1)                     
+      145 +        thread_id, i = cache.get("shared")                    
+      146 +        self.assertIn(thread_id, range(NUM_THREADS))          
+      147 +        self.assertEqual(i, OPS_PER_THREAD - 1)  # each thread
+          +'s final write is its last i                                  
+      148 +        self.assert_still_behaves_like_lru(cache, capacity, ["
+          +shared"])                                                     
+      149  
+      145 -    assert cache.size() == 1                                  
+      146 -    thread_id, i = cache.get("shared")                        
+      147 -    assert 0 <= thread_id < NUM_THREADS                       
+      148 -    assert i == OPS_PER_THREAD - 1  # each thread's final writ
+          -e is its last i                                               
+      149 -    assert_still_behaves_like_lru(cache, capacity, ["shared"])
+      150 +    def test_get_returns_only_values_that_were_written_for_tha
+          +t_key(self) -> None:                                          
+      151 +        """Readers must never see a value belonging to a diffe
+          +rent key (torn update)."""                                    
+      152 +        capacity = 8                                          
+      153 +        cache: LRUCache[str] = LRUCache(capacity)             
+      154 +        keys = [f"k{i}" for i in range(16)]                   
+      155  
+      156 +        def worker(thread_id: int) -> None:                   
+      157 +            rng = random.Random(thread_id)                    
+      158 +            for _ in range(OPS_PER_THREAD):                   
+      159 +                key = rng.choice(keys)                        
+      160 +                if thread_id % 2 == 0:                        
+      161 +                    cache.add(key, f"{key}:{rng.randint(0, 99)
+          +}")                                                           
+      162 +                else:                                         
+      163 +                    value = cache.get(key)                    
+      164 +                    if value is not None and not value.startsw
+          +ith(f"{key}:"):                                               
+      165 +                        raise AssertionError(f"get({key!r}) re
+          +turned {value!r}")                                            
+      166  
+      152 -def test_get_returns_only_values_that_were_written_for_that_ke
+          -y() -> None:                                                  
+      153 -    """Readers must never see a value belonging to a different
+          - key (torn update)."""                                        
+      154 -    capacity = 8                                              
+      155 -    cache: LRUCache[str] = LRUCache(capacity)                 
+      156 -    keys = [f"k{i}" for i in range(16)]                       
+      167 +        run_concurrently(worker)                              
+      168  
+      158 -    def worker(thread_id: int) -> None:                       
+      159 -        rng = random.Random(thread_id)                        
+      160 -        for _ in range(OPS_PER_THREAD):                       
+      161 -            key = rng.choice(keys)                            
+      162 -            if thread_id % 2 == 0:                            
+      163 -                cache.add(key, f"{key}:{rng.randint(0, 99)}") 
+      164 -            else:                                             
+      165 -                value = cache.get(key)                        
+      166 -                assert value is None or value.startswith(f"{ke
+          -y}:")                                                         
+      169 +        self.assert_still_behaves_like_lru(cache, capacity, ke
+          +ys)                                                           
+      170  
+      168 -    run_concurrently(worker)                                  
+      171  
+      170 -    assert_still_behaves_like_lru(cache, capacity, keys)      
+      172 +if __name__ == "__main__":                                    
+      173 +    unittest.main()                                           
+
+⏺ Write(.vscode/settings.json)
+  ⎿  Added 3 lines, removed 3 lines
+      1  {
+      2      "python.defaultInterpreterPath": "${workspaceFolder}/practic
+         e-coding/.venv/bin/python",
+      3 -    "python.testing.pytestEnabled": true,                       
+      4 -    "python.testing.unittestEnabled": false,                    
+      3 +    "python.testing.pytestEnabled": false,                      
+      4 +    "python.testing.unittestEnabled": true,                     
+      5      "python.testing.cwd": "${workspaceFolder}/practice-coding",
+      6 -    "python.testing.pytestArgs": ["tests"]                      
+      6 +    "python.testing.unittestArgs": ["-v", "-s", "tests", "-p", "
+        +test_*.py"]                                                     
+      7  }
+
+⏺ Bash(uv remove --dev pytest 2>&1 | tail -2
+      python3 - <<'EOF'…)
+  ⎿   - pygments==2.21.0
+      - pytest==9.2.0
+     [project]
+     … +16 lines (ctrl+o to expand)
+  ⎿  Updated practice-coding/pyproject.toml (+0 -9)
+      15  [build-system]
+      16  requires = ["uv_build>=0.13.1,<0.14.0"]
+      17  build-backend = "uv_build"
+      18 -                                                               
+      19 -[dependency-groups]                                            
+      20 -dev = [                                                        
+      21 -    "pytest>=9.2.0",                                           
+      22 -]                                                              
+      23 -                                                               
+      24 -[tool.pytest.ini_options]                                      
+      25 -pythonpath = ["src"]                                           
+      26 -testpaths = ["tests"]                                          
+  ⎿  Updated practice-coding/uv.lock (+1 -67)
+       2  revision = 5
+       3  requires-python = ">=3.14"
+       4  
+       5 -[[package]]                                                    
+       6 -name = "colorama"                                              
+       7 -version = "0.4.6"                                              
+       8 -source = { registry = "https://pypi.org/simple" }              
+       9 -sdist = { url = "https://files.pythonhosted.org/packages/d8/53/
+         -6f443c9a4a8358a93a6792e2acffb9d9d5cb0a5cfd8802644b7b1c9a02e4/co
+         -lorama-0.4.6.tar.gz", hash = "sha256:08695f5cb7ed6e0531a2057269
+         -7297273c47b8cae5a63ffc6d6ed5c201be6e44", size = 27697, upload-t
+         -ime = "2022-10-25T02:36:22.414Z" }                             
+      10 -wheels = [                                                     
+      11 -    { url = "https://files.pythonhosted.org/packages/d1/d6/3965
+         -ed04c63042e047cb6a3e6ed1a63a35087b6a609aa3a15ed8ac56c221/colora
+         -ma-0.4.6-py2.py3-none-any.whl", hash = "sha256:4f1d9991f5acc0ca
+         -119f9d443620b77f9d6b33703e51011c16baf57afb285fc6", size = 25335
+         -, upload-time = "2022-10-25T02:36:20.889Z" },                  
+      12 -]                                                              
+      13 -                                                               
+      14 -[[package]]                                                    
+      15 -name = "iniconfig"                                             
+      16 -version = "2.3.1"                                              
+      17 -source = { registry = "https://pypi.org/simple" }              
+      18 -sdist = { url = "https://files.pythonhosted.org/packages/01/e1/
+         -2069291243c926a2ff1cd706c7f3eeb9b62144bf60f77c9fb9ff2fb26bd3/in
+         -iconfig-2.3.1.tar.gz", hash = "sha256:67f4b9c50da0dedf52af349e7
+         -749a80a9057a5031199791b906c3bb3ae878960", size = 21209, upload-
+         -time = "2026-10-06T22:48:38.076Z" }                            
+      19 -wheels = [                                                     
+      20 -    { url = "https://files.pythonhosted.org/packages/56/43/4ca9
+         -e49d27a1fcf6bece6f6aec0ea46bb9112489b93d4b688fb415457bdb/inicon
+         -fig-2.3.1-py3-none-any.whl", hash = "sha256:9121e2c1fdb35523249
+         -5be3194c8dfe87ccc2d5dee45947b78e68f499790d7a7", size = 7552, up
+         -load-time = "2026-10-06T22:48:36.959Z" },                      
+      21 -]                                                              
+      22 -                                                               
+      23 -[[package]]                                                    
+      24 -name = "packaging"                                             
+      25 -version = "26.3"                                               
+      26 -source = { registry = "https://pypi.org/simple" }              
+      27 -sdist = { url = "https://files.pythonhosted.org/packages/7d/fa/
+         -3944b40b07da9ce895c0e6303a5ab7d53da063554f534556b134a54d6093/pa
+         -ckaging-26.3.tar.gz", hash = "sha256:94edc256424af38762eb31306e
+         -ed28beb9f0efc50a8837492c9d6fd6004aed79", size = 313412, upload-
+         -time = "2026-08-04T18:15:28.737Z" }                            
+      28 -wheels = [                                                     
+      29 -    { url = "https://files.pythonhosted.org/packages/63/34/ba1c
+         -580383c9eada3711951fef0795c80b829a078d72188184bcab9dd527/packag
+         -ing-26.3-py3-none-any.whl", hash = "sha256:d7193f7c8e4e93f444fd
+         -e0262bf90af30e16fa0ad0ad44cb553c87339b23cd1c", size = 129956, u
+         -pload-time = "2026-08-04T18:15:27.159Z" },                     
+      30 -]                                                              
+      31 -                                                               
+      32 -[[package]]                                                    
+      33 -name = "pluggy"                                                
+      34 -version = "1.7.0"                                              
+      35 -source = { registry = "https://pypi.org/simple" }              
+      36 -sdist = { url = "https://files.pythonhosted.org/packages/bf/db/
+         -7fc19e6f2dc92a966727031389fc2e08b558f0f25eb7403c1119ad4713cd/pl
+         -uggy-1.7.0.tar.gz", hash = "sha256:d1eaa46ebb595891b860ab086b4d
+         -09c8588af65ebd4361b8e8f4bb8920b90ba8", size = 123304, upload-ti
+         -me = "2026-10-15T09:50:58.343Z" }                              
+      37 -wheels = [                                                     
+      38 -    { url = "https://files.pythonhosted.org/packages/40/9e/2b38
+         -731e0fc536806f16490e1a12d7f0dc2a1235aa8cc07bcc75416a7daa/pluggy
+         --1.7.0-py3-none-any.whl", hash = "sha256:7dd7b0d8832ba3cb632c30
+         -6926ded123429211b83641b35dc5c41ad2d34f9bec", size = 27082, uplo
+         -ad-time = "2026-10-15T09:50:56.808Z" },                        
+      39 -]                                                              
+      40 -                                                               
+       5  [[package]]
+     … 39 more lines (ctrl+o to expand)
+
+⏺ The pyproject.toml is back to its original contents. Next I'll fix the type
+  warning the editor flagged on line 145, then run the tests.
+
+⏺ Update(practice-coding/tests/test_lru_cache.py)
+  ⎿  Added 3 lines, removed 1 line
+      142          run_concurrently(worker)
+      143  
+      144          self.assertEqual(cache.size(), 1)
+      145 -        thread_id, i = cache.get("shared")                    
+      145 +        result = cache.get("shared")                          
+      146 +        assert result is not None                             
+      147 +        thread_id, i = result                                 
+      148          self.assertIn(thread_id, range(NUM_THREADS))
+      149          self.assertEqual(i, OPS_PER_THREAD - 1)  # each thread
+           's final write is its last i
+      150          self.assert_still_behaves_like_lru(cache, capacity, ["
+           shared"])
+⏺ Bash(echo "--- venv, discover ---"; .venv/bin/python -m unittest discover -s
+      tests 2>&1 | tail -3
+      echo "--- system python, no install ---"; PYTHONPATH=src python3 -m…)
+  ⎿  --- venv, discover ---
+     head: Node(__head__, None, prev: __head__, next: a
+     tail: Node(__tail__, None, prev: a, next: __tail__
+     … +10 lines (ctrl+o to expand)
+  ⎿  2 files changed (binary, mode only or too large to show)
+
+⏺ The demo prints at the bottom of lru_cache.py hid the test results, so I'll
+  rerun and show just the summary lines:
+
+  Ran 1 shell command (ctrl+o to expand)
+
+⏺ The tests now use unittest from the standard library, and pytest is gone from
+  the project. All 5 pass, and with the lock disabled 4 still fail, same as
+  before.
+
+  What changed:
+  - tests/test_lru_cache.py (practice-coding/tests/test_lru_cache.py) now uses a
+    unittest.TestCase class with the same 5 tests. The 1µs thread switch
+    interval is set in setUpModule() and restored in tearDownModule(). The
+    behavior check is now a method on the test class and uses self.assert....
+  - In practice-coding/pyproject.toml, the pytest dev dependency and the pytest
+    config are removed, so the file is back to how it was.
+  - .vscode/settings.json now enables unittest instead of pytest. Reload the
+    window and click Refresh in the Testing sidebar to get the run icons.
+
+  Running it (from practice-coding/):
+  python3 -m unittest discover -s tests -v                    # inside the 
+  project venv
+  PYTHONPATH=src python3 -m unittest discover -s tests -v     # any Python, 
+  nothing installed
+  Both work. The second one also passed with your system python3.
+
+  The if __name__ == "__main__": block means you can run python 
+  tests/test_lru_cache.py directly, as long as practice_coding can be imported.
+
+  The demo code at the bottom of lru_cache.py (cache = LRUCache(1) and the
+  debug() calls) still prints on every test run. I haven't changed it because
+  it's your file, but putting it under if __name__ == "__main__": would stop the
+  noise.
+
+❯ <ide_selection>The user selected the lines 1 to 7 from                        
+  /Users/rebeccawong/Development/2026-interview-practice/.vscode/settings.json: 
+  {                                                                             
+      "python.defaultInterpreterPath":                                          
+  "${workspaceFolder}/practice-coding/.venv/bin/python",                        
+      "python.testing.pytestEnabled": false,                                    
+      "python.testing.unittestEnabled": true,                                   
+      "python.testing.cwd": "${workspaceFolder}/practice-coding",               
+      "python.testing.unittestArgs": ["-v", "-s", "tests", "-p", "test_*.py"]   
+  }                                                                             
+                                                                                
+  This may or may not be related to the current task.</ide_selection>           
+
+❯ Do I still need settings.json?                                                
+
+⏺ You only need it for running tests from VS Code. From the command line
+  (python3 -m unittest discover -s tests) it does nothing.
+
+  For VS Code, you do still need it:
+  - unittestEnabled: VS Code doesn't turn on any test framework by default, so
+    without this there are no run icons.
+  - cwd and unittestArgs: your workspace is the whole repo, but the tests live
+    in practice-coding/tests, and imports only work from practice-coding. These
+    two settings point discovery there.
+  - defaultInterpreterPath: a fallback. If no interpreter is selected, VS Code
+    uses the practice-coding venv, where practice_coding can be imported. If
+    you've already selected that interpreter yourself, you don't need this line.
+
+  Two lines can go:
+  - "python.testing.pytestEnabled": false is already VS Code's default.
+  - "-v" is optional; it only makes the test output more detailed.
+
+  If you delete the file, you can get it back by running "Python: Configure 
+  Tests" from the command palette and choosing unittest, then
+  practice-coding/tests. That writes almost the same settings. You'd probably
+  still need to add cwd by hand, because of how this repo is laid out.
+
+  So keep it, possibly minus those two lines. I can trim it if you like.

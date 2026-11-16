@@ -1,4 +1,4 @@
-
+import threading
 
 class Node[T]:
     def __init__(self, key: str, value: None|T):
@@ -14,6 +14,7 @@ class Node[T]:
 
 class LRUCache[T]:
     def __init__(self, capacity):
+        self.lock = threading.RLock()
         self.capacity = capacity
         self.data: dict[str, Node[T]] = {}
         self.head: Node[T] = Node("__head__", None)
@@ -36,29 +37,32 @@ class LRUCache[T]:
 
 
     def add(self, key: str, value: T) -> None:
-        node = self.data.get(key)
-        if node is None:
-            node = Node(key, value)
-            self.data[key] = node
-        else:
-            node.value = value
+        with self.lock:
+            node = self.data.get(key)
+            if node is None:
+                node = Node(key, value)
+                self.data[key] = node
+            else:
+                node.value = value
 
-        self._move_node_to_front(node)
-        if self.size() > self.capacity:
-            to_remove = self.tail.prev
-            self._remove(to_remove)
-            del self.data[to_remove.key]
+            self._move_node_to_front(node)
+            if self.size() > self.capacity:
+                to_remove = self.tail.prev
+                self._remove(to_remove)
+                del self.data[to_remove.key]
         
 
     def get(self, key: str) -> T | None:
-        if key not in self.data:
-            return None
-        value_node = self.data[key]
-        self._move_node_to_front(value_node)
-        return value_node.value
+        with self.lock:
+            if key not in self.data:
+                return None
+            value_node = self.data[key]
+            self._move_node_to_front(value_node)
+            return value_node.value
 
     def size(self) -> int:
-        return len(self.data)
+        with self.lock:
+            return len(self.data)
 
     def debug(self):
         print(f"data: {self.data}")
